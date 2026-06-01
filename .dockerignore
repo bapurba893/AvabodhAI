@@ -1,0 +1,52 @@
+# .dockerignore
+# --------------
+# These files are NOT copied into the Docker image.
+# Keeps image small and secure.
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment — never include in Docker
+venv/
+env/
+.env/
+
+# Environment files — never include secrets in image
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite
+
+# VS Code
+.vscode/
+
+# Git
+.git/
+.gitignore
+
+# Test files
+tests/
+pytest_cache/
+.coverage
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Uploaded files — these are runtime data, not code
+uploaded_files/
+documents/

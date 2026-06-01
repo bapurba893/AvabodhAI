@@ -1,0 +1,187 @@
+{
+  "info": {
+    "name": "Avabodh API",
+    "description": "Document Intelligence API — test all endpoints",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "doc_id",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Root",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/",
+            "description": "Check API is running"
+          }
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health/",
+            "description": "Basic health check"
+          }
+        },
+        {
+          "name": "Database Health",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health/db",
+            "description": "Check PostgreSQL connection"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Documents",
+      "item": [
+        {
+          "name": "Upload Document",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/documents/upload",
+            "description": "Upload PDF/TXT/DOCX/CSV — generates summary and saves to PostgreSQL",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Select your PDF, TXT, DOCX or CSV file here"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201 || pm.response.code === 200) {",
+                  "    var data = pm.response.json();",
+                  "    pm.collectionVariables.set('doc_id', data.id);",
+                  "    console.log('Saved doc_id:', data.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List All Documents",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/documents/?page=1&per_page=10",
+              "query": [
+                {"key": "page", "value": "1"},
+                {"key": "per_page", "value": "10"}
+              ]
+            },
+            "description": "List all summaries with pagination"
+          }
+        },
+        {
+          "name": "Get Document by ID",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/documents/{{doc_id}}",
+            "description": "Get full summary by UUID — auto-filled after upload"
+          }
+        },
+        {
+          "name": "Update Document Name",
+          "request": {
+            "method": "PATCH",
+            "url": "{{base_url}}/documents/{{doc_id}}",
+            "description": "Rename a document",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"doc_name\": \"My Renamed Document\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Document",
+          "request": {
+            "method": "DELETE",
+            "url": "{{base_url}}/documents/{{doc_id}}",
+            "description": "Permanently delete a document summary"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Validation Tests",
+      "item": [
+        {
+          "name": "Upload Invalid File Type",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/documents/upload",
+            "description": "Should return 422 — .exe not allowed",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "value": "fake content",
+                  "type": "text",
+                  "description": "test.exe — should be rejected"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Invalid UUID",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/documents/not-a-valid-uuid",
+            "description": "Should return 422 — invalid UUID format"
+          }
+        },
+        {
+          "name": "Get Nonexistent Document",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/documents/00000000-0000-0000-0000-000000000000",
+            "description": "Should return 404 — document not found"
+          }
+        },
+        {
+          "name": "Update Empty Name",
+          "request": {
+            "method": "PATCH",
+            "url": "{{base_url}}/documents/{{doc_id}}",
+            "description": "Should return 422 — empty doc_name not allowed",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n    \"doc_name\": \"\"\n}"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

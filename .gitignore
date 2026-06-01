@@ -1,0 +1,38 @@
+# Environment — NEVER push to GitHub
+.env
+.env.*
+!.env.example
+
+# Virtual environment
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# Uploaded files — user private data
+uploaded_files/
+documents/
+
+# Database
+*.db
+*.sqlite
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test cache
+.pytest_cache/
+.coverage
