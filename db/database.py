@@ -1,7 +1,8 @@
 """
-core/database.py
-----------------
-SQLAlchemy engine + session for FastAPI dependency injection.
+db/database.py
+--------------
+SQLAlchemy engine + session factory.
+Updated to enable pgvector extension on startup.
 """
 
 from contextlib import contextmanager
@@ -31,25 +32,37 @@ SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def init_db() -> None:
-    """Create all tables if they don't exist."""
+    """
+    Create all tables if they don't exist.
+    Also enables pgvector extension — required before creating vector columns.
+    """
     try:
+        with engine.connect() as conn:
+            # Enable pgvector extension — must run before creating vector columns
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.commit()
+            logger.info("pgvector extension enabled.")
+
         Base.metadata.create_all(bind=engine)
-        logger.info("Database tables verified / created.")
+        logger.info("Database tables verified / created successfully.")
     except OperationalError as e:
         logger.critical("Cannot connect to PostgreSQL: %s", e)
         raise
 
 
-# ── FastAPI dependency injection ──────────────────────────────────────────────
-def get_db_session() -> Generator[Session, None, None]:
-    """
-    FastAPI dependency — yields a DB session per request.
-    Automatically commits on success, rolls back on error, closes always.
+def check_db_connection() -> bool:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception as e:
+        logger.error("DB health check failed: %s", e)
+        return False
 
-    Usage in route:
-        async def my_route(db: Session = Depends(get_db_session)):
-    """
-    session = SessionFactory()
+
+@contextmanager
+def get_db_session() -> Generator[Session, None, None]:
+    session: Session = SessionFactory()
     try:
         yield session
         session.commit()
@@ -62,8 +75,21 @@ def get_db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def get_db_session_context() -> Generator[Session, None, None]:
-    """Context manager version for use outside FastAPI routes."""
-    session = SessionFactory()
+    """Context manager for use outside FastAPI routes."""
+    session: Session = SessionFactory()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_db_session_fastapi() -> Generator[Session, None, None]:
+    """FastAPI dependency injection version."""
+    session: Session = SessionFactory()
     try:
         yield session
         session.commit()

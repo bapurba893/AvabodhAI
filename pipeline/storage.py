@@ -114,6 +114,8 @@ def save_summary(
             same_name.model_used   = validated.model_used
             same_name.language     = validated.language
             same_name.updated_at   = datetime.now(timezone.utc)
+            same_name.embedding_status = "pending"
+            same_name.embedding_model  = None
             session.add(same_name)
             session.flush()
             logger.info(
@@ -124,16 +126,20 @@ def save_summary(
 
         # New document — insert fresh row
         record = DocumentSummary(
-            doc_name     = validated.doc_name,
-            summary_text = validated.summary_text,
-            key_topics   = ", ".join(validated.key_topics),
-            page_count   = validated.page_count,
-            chunk_count  = chunk_count,
-            source_path  = validated.source_path,
-            language     = validated.language,
-            model_used   = validated.model_used,
-            confidence   = validated.confidence_score,
-            doc_hash     = file_hash,
+            doc_name          = validated.doc_name,
+            summary_text      = validated.summary_text,
+            key_topics        = ", ".join(validated.key_topics),
+            page_count        = validated.page_count,
+            chunk_count       = chunk_count,
+            source_path       = validated.source_path,
+            language          = validated.language,
+            model_used        = validated.model_used,
+            confidence        = validated.confidence_score,
+            doc_hash          = file_hash,
+            embedding_status  = "pending",      # will be updated to 'completed' by embedder
+            embedding_model   = None,           # filled by embedder after storing
+            avg_chunk_size    = None,           # filled by embedder
+            embedding_stored_at = None,         # filled by embedder
         )
         session.add(record)
         session.flush()  # get the ID before session closes

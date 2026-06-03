@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     MAP_MODEL: str = "llama3.2"
     REDUCE_MODEL: str = "llama3.2"
     EMBEDDING_MODEL: str = "nomic-embed-text"   # local embedding model for Ollama
+    # ── pgvector 
+    EMBEDDING_DIMENSIONS: int = 1536    # text-embedding-3-small = 1536
+                                     # text-embedding-3-large = 3072
+    EMBEDDING_BATCH_SIZE: int = 100     # chunks per batch to OpenAI
 
     #OLLAMA_BASE_URL: str = "http://localhost:11434"  # default Ollama port
     GROQ_API_KEY: str = ""
@@ -43,8 +47,8 @@ class Settings(BaseSettings):
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
     DB_NAME: str = "Avabodh"
-    DB_USER: str = ""
-    DB_PASSWORD: str = ""
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str = "postgres123"
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: int = 30

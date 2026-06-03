@@ -1,85 +1,61 @@
-# docker-compose.yml
-# -------------------
-# Runs both the API and PostgreSQL together in containers.
-# Team members only need this one file + .env to run everything.
-#
-# Usage:
-#   docker-compose up --build      # first time
-#   docker-compose up              # after first time
-#   docker-compose down            # stop everything
-
 version: '3.8'
 
 services:
-
-  # ── PostgreSQL Database ──────────────────────────────────────────────────
   db:
-    image: postgres:16-alpine        # lightweight postgres image
+    # pgvector image — has vector extension built in
+    image: pgvector/pgvector:pg16
     container_name: avabodh_db
     restart: always
     environment:
-      POSTGRES_DB:       ${DB_NAME:-Avabodh}
+      POSTGRES_DB:       ${DB_NAME:-avabodh}
       POSTGRES_USER:     ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
-      # Data persists even when container stops
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # ── Avabodh API ───────────────────────────────────────────────────────────
   api:
-    build: .                         # builds from Dockerfile in current folder
+    build: .
     container_name: avabodh_api
     restart: always
     ports:
       - "8000:8000"
     environment:
-      # LLM
-      OPENAI_API_KEY:     ${OPENAI_API_KEY}
-      MAP_MODEL:          ${MAP_MODEL:-gpt-4o-mini}
-      REDUCE_MODEL:       ${REDUCE_MODEL:-gpt-4o-mini}
-      EMBEDDING_MODEL:    ${EMBEDDING_MODEL:-text-embedding-3-small}
-
-      # PostgreSQL — points to the db service above, not localhost
-      DB_HOST:     db                # 'db' is the service name above
-      DB_PORT:     5432
-      DB_NAME:     ${DB_NAME:-Avabodh}
-      DB_USER:     ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD}
-
-      # Document settings
-      DOCUMENTS_DIR:      ./documents
-      MIN_CHUNK_SIZE:     ${MIN_CHUNK_SIZE:-100}
-      MAX_CHUNK_SIZE:     ${MAX_CHUNK_SIZE:-3000}
-      SUMMARY_MAX_LENGTH: ${SUMMARY_MAX_LENGTH:-2000}
-      SUMMARY_LANGUAGE:   ${SUMMARY_LANGUAGE:-English}
-
-      # LangSmith (optional)
+      OPENAI_API_KEY:       ${OPENAI_API_KEY}
+      MAP_MODEL:            ${MAP_MODEL:-gpt-4o-mini}
+      REDUCE_MODEL:         ${REDUCE_MODEL:-gpt-4o-mini}
+      EMBEDDING_MODEL:      ${EMBEDDING_MODEL:-text-embedding-3-small}
+      DB_HOST:              db
+      DB_PORT:              5432
+      DB_NAME:              ${DB_NAME:-avabodh}
+      DB_USER:              ${DB_USER:-postgres}
+      DB_PASSWORD:          ${DB_PASSWORD}
+      DOCUMENTS_DIR:        ./documents
+      MIN_CHUNK_SIZE:       ${MIN_CHUNK_SIZE:-100}
+      MAX_CHUNK_SIZE:       ${MAX_CHUNK_SIZE:-3000}
+      SUMMARY_MAX_LENGTH:   ${SUMMARY_MAX_LENGTH:-2000}
+      SUMMARY_LANGUAGE:     ${SUMMARY_LANGUAGE:-English}
       LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
       LANGCHAIN_ENDPOINT:   ${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
       LANGCHAIN_API_KEY:    ${LANGCHAIN_API_KEY}
       LANGCHAIN_PROJECT:    ${LANGCHAIN_PROJECT:-Avabodh Project}
-
-      # Logging
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FILE:  avabodh.log
-
-      PYTHONIOENCODING: utf-8
-
+      LOG_LEVEL:            ${LOG_LEVEL:-INFO}
+      LOG_FILE:             avabodh.log
+      PYTHONIOENCODING:     utf-8
     depends_on:
       db:
-        condition: service_healthy   # waits for DB to be ready before starting API
+        condition: service_healthy
     volumes:
       - uploaded_files:/app/uploaded_files
       - documents:/app/documents
 
 volumes:
-  postgres_data:      # persists database data
-  uploaded_files:     # persists uploaded files
-  documents:          # persists documents folder
+  postgres_data:
+  uploaded_files:
+  documents:

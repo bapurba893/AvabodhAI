@@ -65,7 +65,7 @@ def split_documents(docs: list[Document]) -> list[Document]:
     """
     embeddings = OpenAIEmbeddings(
     api_key=settings.OPENAI_API_KEY,
-    model=settings.EMBEDDING_MODEL,
+    model="text-embedding-3-small",
     )
 
     chunker = SemanticChunker(
@@ -108,6 +108,9 @@ def split_documents(docs: list[Document]) -> list[Document]:
     for i, chunk in enumerate(cleaned):
         chunk.metadata["chunk_index"] = i
         chunk.metadata["chunk_count"] = len(cleaned)
+        # Ensure page number is carried through for embedder
+        if "page" not in chunk.metadata:
+            chunk.metadata["page"] = chunk.metadata.get("page_number", None)
 
     logger.info(
         "Splitting complete — %d chunks produced, %d discarded (too small)",

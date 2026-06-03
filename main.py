@@ -10,6 +10,7 @@ from api.routes import documents, health
 from api.middleware.logging_middleware import LoggingMiddleware
 from db.database import init_db
 from utils.logger import get_logger
+from api.routes import search
 
 logger = get_logger(__name__)
 
@@ -42,6 +43,7 @@ app.add_middleware(LoggingMiddleware)
 
 app.include_router(health.router, prefix="/health", tags=["Health"])
 app.include_router(documents.router, prefix="/documents", tags=["Documents"])
+app.include_router(search.router, prefix="/search", tags=["Search"])
 
 
 @app.get("/", tags=["Root"])
