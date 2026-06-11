@@ -11,6 +11,7 @@ from api.middleware.logging_middleware import LoggingMiddleware
 from db.database import init_db
 from utils.logger import get_logger
 from api.routes import search
+from api.routes import chat
 
 logger = get_logger(__name__)
 
@@ -43,6 +44,7 @@ app.add_middleware(LoggingMiddleware)
 
 app.include_router(health.router, prefix="/health", tags=["Health"])
 app.include_router(documents.router, prefix="/documents", tags=["Documents"])
+app.include_router(chat.router, prefix="/chat", tags=["Chat"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
 
 

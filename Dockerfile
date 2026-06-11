@@ -49,8 +49,8 @@ EXPOSE 8000
 
 # ── Health check ──────────────────────────────────────────────────────────────
 # Docker checks this every 30s — marks container unhealthy if it fails
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/')" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 # ── Start command ─────────────────────────────────────────────────────────────
 # 0.0.0.0 makes it accessible from outside the container
