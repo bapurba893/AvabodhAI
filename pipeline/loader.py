@@ -18,7 +18,7 @@ from typing import Generator
 
 from langchain_community.document_loaders import (
     DirectoryLoader,
-    PyPDFLoader,
+    PyMuPDFLoader,
     TextLoader,
     UnstructuredWordDocumentLoader,
     CSVLoader,
@@ -33,7 +33,7 @@ settings = get_settings()
 
 # Map file extension → LangChain loader class
 LOADER_MAP = {
-    ".pdf": PyPDFLoader,
+    ".pdf": PyMuPDFLoader,
     ".txt":  TextLoader,
     ".docx": UnstructuredWordDocumentLoader,
     ".csv":  CSVLoader,

@@ -15,10 +15,9 @@ GET    /chat/threads/{id}/messages — get all messages in thread
 
 import uuid
 import json
-from typing import Optional, AsyncGenerator
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from api.schemas.chat import (
@@ -214,94 +213,6 @@ async def send_message(
         sources      = [SourceReference(**s) for s in sources],
         thread_title = thread_title,
         created_at   = __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /chat/stream — SSE streaming response
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.get(
-    "/stream",
-    summary="Send a message and receive token-by-token SSE stream",
-)
-async def stream_message(
-    query:      str           = Query(..., min_length=1, description="User query"),
-    thread_id:  Optional[str] = Query(default=None, description="Thread ID"),
-    doc_filter: Optional[str] = Query(default=None, description="Filter by doc name"),
-    top_k:      int           = Query(default=5, ge=1, le=20),
-    db: Session = Depends(get_db_session_fastapi),
-):
-    """
-    Streaming endpoint using Server-Sent Events (SSE).
-    Tokens appear word by word in real time — like ChatGPT.
-
-    Client connects and receives:
-        data: The\n\n
-        data:  answer\n\n
-        data:  is...\n\n
-        data: [DONE]\n\n
-        data: {"thread_id": "...", "sources": [...]}\n\n
-    """
-    request = ChatMessageRequest(
-        query      = query,
-        thread_id  = uuid.UUID(thread_id) if thread_id else None,
-        doc_filter = doc_filter,
-        top_k      = top_k,
-    )
-
-    thread_id_str, is_new_thread, memory, chunks, prompt = await _prepare_chat(request, db)
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        # Send thread_id immediately so client knows which thread
-        yield f"data: {json.dumps({'thread_id': thread_id_str})}\n\n"
-
-        if not chunks:
-            fallback = "I don't have relevant information in the documents to answer your question."
-            yield f"data: {fallback}\n\n"
-            yield "data: [DONE]\n\n"
-            await _save_turn(thread_id_str, is_new_thread, query, fallback, [])
-            return
-
-        # Stream tokens
-        full_tokens = []
-        async for token in chat_stream(prompt):
-            if token == "[DONE]":
-                yield "data: [DONE]\n\n"
-                break
-            elif token.startswith("[ERROR]"):
-                yield f"data: {token}\n\n"
-                break
-            else:
-                full_tokens.append(token)
-                yield f"data: {token}\n\n"
-
-        # Full response collected — save to DB after stream ends
-        full_answer = "".join(full_tokens)
-        sources = _build_sources(chunks)
-        thread_title = await _save_turn(
-            thread_id     = thread_id_str,
-            is_new_thread = is_new_thread,
-            query         = query,
-            answer        = full_answer,
-            sources       = sources,
-        )
-
-        # Send metadata at end of stream
-        meta = {
-            "sources":      sources,
-            "thread_title": thread_title,
-        }
-        yield f"data: {json.dumps(meta)}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",
-            "Access-Control-Allow-Origin": "*",
-        },
     )
 
 

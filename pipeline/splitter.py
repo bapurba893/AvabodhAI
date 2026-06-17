@@ -17,7 +17,7 @@ HuggingFace change:
 - Runs LOCALLY — no API call, no cost for this step
 - Model downloaded once and cached (~90MB)
 """
-
+import re
 from langchain_experimental.text_splitter import SemanticChunker
 #from langchain_ollama import OllamaEmbeddings   # was: OpenAIEmbeddings
 from langchain_openai import OpenAIEmbeddings
@@ -29,6 +29,60 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+def clean_extracted_text(text: str) -> str:
+    """
+    Clean PDF-extracted text before splitting.
+    Fixes hyphenation, removes noise, normalises whitespace.
+    """
+    # Fix hyphenated words broken across lines — "Aper-\nture" → "Aperture"
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
+
+    # Remove excessive newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # Remove page numbers standing alone on a line
+    text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
+
+    # Remove lines that are just special characters or very short noise
+    text = re.sub(r'^\s*[\W_]{1,5}\s*$', '', text, flags=re.MULTILINE)
+
+    # Fix words split across lines without hyphen
+    text = re.sub(r'([a-z]{2,})\n([a-z]{2,})', r'\1 \2', text)
+
+    # Normalise whitespace
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n ', '\n', text)
+
+    return text.strip()
+
+
+def is_meaningful_chunk(text: str) -> bool:
+    """
+    Returns False for chunks that are noise — too short,
+    only numbers, or not enough real words.
+    """
+    text = text.strip()
+
+    # Too short
+    if len(text) < 200:
+        return False
+
+    # Only numbers and punctuation
+    if re.match(r'^[\d\s\.\,\:\;\-\_\(\)]+$', text):
+        return False
+
+    # Less than 5 actual words
+    words = [w for w in text.split() if len(w) > 2]
+    if len(words) < 5:
+        return False
+
+    # Mostly special characters — less than 50% alphabetic
+    alpha_ratio = sum(c.isalpha() for c in text) / len(text)
+    if alpha_ratio < 0.5:
+        return False
+
+    return True
 
 
 def _hard_split_large_chunk(doc: Document) -> list[Document]:
@@ -74,6 +128,10 @@ def split_documents(docs: list[Document]) -> list[Document]:
         breakpoint_threshold_amount=settings.CHUNK_BREAKPOINT_THRESHOLD,
     )
 
+    # Clean each document before splitting
+    for doc in docs:
+        doc.page_content = clean_extracted_text(doc.page_content)
+
     try:
         raw_chunks = chunker.split_documents(docs)
     except Exception as e:
@@ -90,8 +148,8 @@ def split_documents(docs: list[Document]) -> list[Document]:
     for chunk in raw_chunks:
         text = chunk.page_content.strip()
 
-        # 1. Discard empty or too-small chunks
-        if len(text) < settings.MIN_CHUNK_SIZE:
+        # 1. Discard noise chunks using meaningful chunk filter
+        if not is_meaningful_chunk(text):
             discarded += 1
             continue
 

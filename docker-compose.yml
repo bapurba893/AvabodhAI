@@ -21,7 +21,7 @@ services:
       retries: 5
 
   api:
-    build: .
+    image: apurbapm/avabodhai-api:latest
     container_name: avabodh_api
     restart: always
     ports:
