@@ -38,6 +38,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# ── Install Playwright browser ────────────────────────────────────────────────
+RUN playwright install-deps chromium
+RUN playwright install chromium
+
 # ── Copy application code ─────────────────────────────────────────────────────
 COPY . .
 
@@ -55,4 +59,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
 # ── Start command ─────────────────────────────────────────────────────────────
 # 0.0.0.0 makes it accessible from outside the container
 # workers=2 handles multiple requests simultaneously
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

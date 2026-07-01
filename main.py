@@ -12,6 +12,7 @@ from db.database import init_db
 from utils.logger import get_logger
 from api.routes import search
 from api.routes import chat
+from api.routes.web import router as web_router
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,7 @@ app.include_router(health.router, prefix="/health", tags=["Health"])
 app.include_router(documents.router, prefix="/documents", tags=["Documents"])
 app.include_router(chat.router, prefix="/chat", tags=["Chat"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
+app.include_router(web_router, prefix="/web", tags=["Web Scraping"])
 
 
 @app.get("/", tags=["Root"])

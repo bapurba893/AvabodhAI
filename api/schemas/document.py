@@ -5,6 +5,10 @@ Pydantic schemas for request and response validation.
 
 Every API input and output is validated here.
 FastAPI uses these automatically — wrong data type = 422 error with clear message.
+
+NEW: document-level metadata fields added to response schemas
+(title, author, document_type, domain, key_entities, mentioned_dates,
+target_audience, sentiment, confidentiality_level, metadata_status).
 """
 
 from datetime import datetime
@@ -31,6 +35,19 @@ class DocumentUploadResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
+
+    # ── NEW — document-level extracted metadata ───────────────────────────────
+    title:                  Optional[str] = None
+    author:                 Optional[str] = None
+    document_type:          Optional[str] = None
+    domain:                 Optional[str] = None
+    key_entities:           Optional[list[str]] = None
+    mentioned_dates:        Optional[list[str]] = None
+    target_audience:        Optional[str] = None
+    sentiment:               Optional[str] = None
+    confidentiality_level:  Optional[str] = None
+    metadata_status:         Optional[str] = None
+
     created_at:   datetime
     updated_at:   Optional[datetime] = None
     elapsed_sec:  Optional[float] = None    # how long summarisation took
@@ -46,6 +63,8 @@ class DocumentListItem(BaseModel):
     page_count:  int
     chunk_count: int
     model_used:  Optional[str] = None
+    document_type: Optional[str] = None    # NEW — useful for list filtering UI
+    domain:        Optional[str] = None    # NEW
     created_at:  datetime
     # First 200 chars of summary as preview
     summary_preview: Optional[str] = None
@@ -74,6 +93,19 @@ class DocumentDetailResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
+
+    # ── NEW — document-level extracted metadata ───────────────────────────────
+    title:                  Optional[str] = None
+    author:                 Optional[str] = None
+    document_type:          Optional[str] = None
+    domain:                 Optional[str] = None
+    key_entities:           Optional[list[str]] = None
+    mentioned_dates:        Optional[list[str]] = None
+    target_audience:        Optional[str] = None
+    sentiment:               Optional[str] = None
+    confidentiality_level:  Optional[str] = None
+    metadata_status:         Optional[str] = None
+
     created_at:   datetime
     updated_at:   Optional[datetime] = None
 
@@ -110,6 +142,21 @@ class DeleteResponse(BaseModel):
     """Returned after successful delete."""
     id:      UUID
     message: str = "Document deleted successfully"
+
+
+# ── NEW — Chunk metadata schema (for search/chunk endpoints) ──────────────────
+
+class ChunkMetadataResponse(BaseModel):
+    """Metadata fields for a single chunk — used in search and chunk-listing endpoints."""
+    section_heading:     Optional[str] = None
+    chunk_type:           Optional[str] = None
+    topic:                 Optional[str] = None
+    entities:               Optional[list[str]] = None
+    contains_data:          Optional[bool] = None
+    metadata_confidence:    Optional[float] = None
+
+    class Config:
+        from_attributes = True
 
 
 # ── Error schemas ─────────────────────────────────────────────────────────────

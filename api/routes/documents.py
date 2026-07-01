@@ -2,6 +2,12 @@
 api/routes/documents.py
 -----------------------
 All document-related API endpoints.
+
+CHANGES FOR METADATA EXTRACTION:
+- raw_result now contains "chunk_metadata" and "document_metadata"
+- save_summary() now receives document_metadata
+- store_chunk_embeddings() now receives chunk_metadata
+- Upload response includes new metadata fields
 """
 
 import os
@@ -97,6 +103,9 @@ async def upload_document(
             if existing.embedding_status == "pending":
                 try:
                     chunks = split_documents(docs)
+                    # NOTE: re-embedding an existing doc skips metadata extraction
+                    # (no LLM call here) — embeddings only. Re-upload triggers
+                    # full pipeline only for genuinely new/changed documents.
                     store_chunk_embeddings(
                         chunks      = chunks,
                         summary_id  = existing.id,
@@ -121,6 +130,12 @@ async def upload_document(
                     "language":     existing.language,
                     "model_used":   existing.model_used,
                     "doc_hash":     existing.doc_hash,
+                    "title":        existing.title,
+                    "author":       existing.author,
+                    "document_type": existing.document_type,
+                    "domain":       existing.domain,
+                    "key_entities": existing.key_entities,
+                    "metadata_status": existing.metadata_status,
                     "created_at":   str(existing.created_at),
                     "updated_at":   str(existing.updated_at) if existing.updated_at else None,
                     "elapsed_sec":  0.0,
@@ -144,12 +159,16 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Splitting failed: {e}")
 
-    # ── Step 3: Summarise ─────────────────────────────────────────────────
+    # ── Step 3: Summarise + extract metadata ────────────────────────────────
     try:
         raw_result = summarise_document(chunks, doc_name=file.filename)
         logger.info("Summarisation complete in %.2fs", raw_result["elapsed_sec"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Summarisation failed: {e}")
+
+    # Extracted metadata from the summariser result
+    chunk_metadata     = raw_result.get("chunk_metadata", [])
+    document_metadata  = raw_result.get("document_metadata")
 
     # ── Step 4: Validate output (Pydantic) ────────────────────────────────
     try:
@@ -163,23 +182,29 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Output validation failed: {e}")
 
-    # ── Step 5: Save summary to PostgreSQL ───────────────────────────────
+    # ── Step 5: Save summary + document metadata to PostgreSQL ─────────────
     try:
-        record = save_summary(validated, file_hash, chunk_count)
+        record = save_summary(
+            validated,
+            file_hash,
+            chunk_count,
+            document_metadata=document_metadata,
+        )
         logger.info("Saved to PostgreSQL — ID: %s", record.id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
 
-    # ── Step 6: Store chunk embeddings in pgvector ───────────────────────
+    # ── Step 6: Store chunk embeddings + chunk metadata in pgvector ────────
     try:
         store_chunk_embeddings(
-            chunks      = chunks,
-            summary_id  = record.id,
-            doc_hash    = file_hash,
-            doc_name    = file.filename,
-            source_path = temp_path,
+            chunks         = chunks,
+            summary_id     = record.id,
+            doc_hash       = file_hash,
+            doc_name       = file.filename,
+            source_path    = temp_path,
+            chunk_metadata = chunk_metadata,
         )
-        logger.info("Embeddings stored for '%s'", file.filename)
+        logger.info("Embeddings + chunk metadata stored for '%s'", file.filename)
     except Exception as e:
         # Embedding failure does NOT fail the whole request
         # Summary is already saved — embeddings can be backfilled later
@@ -197,6 +222,16 @@ async def upload_document(
         language    = record.language,
         model_used  = record.model_used,
         doc_hash    = record.doc_hash,
+        title           = record.title,
+        author          = record.author,
+        document_type   = record.document_type,
+        domain          = record.domain,
+        key_entities    = record.key_entities,
+        mentioned_dates = record.mentioned_dates,
+        target_audience = record.target_audience,
+        sentiment       = record.sentiment,
+        confidentiality_level = record.confidentiality_level,
+        metadata_status = record.metadata_status,
         created_at  = record.created_at,
         updated_at  = record.updated_at,
         elapsed_sec = raw_result.get("elapsed_sec"),
@@ -207,12 +242,22 @@ async def upload_document(
 async def list_documents(
     page:     int = Query(default=1, ge=1),
     per_page: int = Query(default=10, ge=1, le=100),
+    document_type: Optional[str] = Query(default=None, description="Filter by document type"),
+    domain:        Optional[str] = Query(default=None, description="Filter by domain"),
     db: Session = Depends(get_db_session_fastapi),
 ):
     offset = (page - 1) * per_page
-    total  = db.query(DocumentSummary).count()
+    query = db.query(DocumentSummary)
+
+    # NEW — optional filtering by extracted metadata
+    if document_type:
+        query = query.filter(DocumentSummary.document_type == document_type.lower())
+    if domain:
+        query = query.filter(DocumentSummary.domain == domain.lower())
+
+    total  = query.count()
     records = (
-        db.query(DocumentSummary)
+        query
         .order_by(DocumentSummary.created_at.desc())
         .offset(offset).limit(per_page).all()
     )
@@ -223,6 +268,8 @@ async def list_documents(
             page_count     = rec.page_count or 0,
             chunk_count    = rec.chunk_count or 0,
             model_used     = rec.model_used,
+            document_type  = rec.document_type,
+            domain         = rec.domain,
             created_at     = rec.created_at,
             summary_preview= rec.summary_text[:200] if rec.summary_text else None,
         )
@@ -241,7 +288,14 @@ async def get_document(doc_id: uuid.UUID, db: Session = Depends(get_db_session_f
         key_topics=record.key_topics, page_count=record.page_count or 0,
         chunk_count=record.chunk_count or 0, source_path=record.source_path,
         language=record.language, model_used=record.model_used,
-        doc_hash=record.doc_hash, created_at=record.created_at, updated_at=record.updated_at,
+        doc_hash=record.doc_hash,
+        title=record.title, author=record.author,
+        document_type=record.document_type, domain=record.domain,
+        key_entities=record.key_entities, mentioned_dates=record.mentioned_dates,
+        target_audience=record.target_audience, sentiment=record.sentiment,
+        confidentiality_level=record.confidentiality_level,
+        metadata_status=record.metadata_status,
+        created_at=record.created_at, updated_at=record.updated_at,
     )
 
 

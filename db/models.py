@@ -3,10 +3,10 @@ db/models.py
 ------------
 Four ORM tables:
 1. DocumentSummaryOutput  — Pydantic LLM output validator
-2. DocumentSummary        — document summaries table
-3. DocumentChunk          — pgvector chunk embeddings table
-4. ChatThread             — NEW: chat conversation threads
-5. ChatMessage            — NEW: individual chat messages with embeddings
+2. DocumentSummary        — document summaries table (+ document-level metadata)
+3. DocumentChunk          — pgvector chunk embeddings table (+ chunk-level metadata)
+4. ChatThread             — chat conversation threads
+5. ChatMessage            — individual chat messages with embeddings
 """
 
 import uuid
@@ -16,9 +16,9 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     Column, DateTime, Integer, String, Text, Float,
-    Index, ForeignKey, JSON
+    Index, ForeignKey, JSON, Boolean
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import DeclarativeBase, relationship
 from pgvector.sqlalchemy import Vector
 
@@ -51,6 +51,65 @@ class DocumentSummaryOutput(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEW — Pydantic schemas for metadata extraction (LLM structured output)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DocumentMetadataOutput(BaseModel):
+    """
+    Document-level metadata — extracted once per document via LLM,
+    using structured output during/after the Reduce step.
+    """
+    title:                str  = Field(default="", description="Real document title, not filename")
+    author:               Optional[str] = Field(default=None, description="Author if mentioned in document")
+    document_type:        str  = Field(default="other",
+                                       description="resume, research_paper, contract, report, invoice, manual, article, other")
+    domain:                str  = Field(default="general",
+                                       description="legal, technical, financial, academic, medical, general")
+    detected_language:    str  = Field(default="English")
+    key_entities:          list[str] = Field(default_factory=list, description="Organizations, people, locations mentioned")
+    mentioned_dates:       list[str] = Field(default_factory=list, description="Any dates referenced in the document")
+    target_audience:       str  = Field(default="general", description="technical, general, executive")
+    sentiment:              str  = Field(default="neutral", description="positive, negative, neutral, critical")
+    confidentiality_level: str  = Field(default="public", description="public, internal, confidential")
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def clean_title(cls, v) -> str:
+        return v.strip()[:512] if isinstance(v, str) else ""
+
+    @field_validator("document_type", "domain", "target_audience", "sentiment", "confidentiality_level", mode="before")
+    @classmethod
+    def lowercase_enum(cls, v) -> str:
+        return str(v).strip().lower() if v else "other"
+
+
+class ChunkMetadataOutput(BaseModel):
+    """
+    Chunk-level metadata — extracted during the Map step alongside
+    the existing summary, using the SAME LLM call (no extra cost).
+    """
+    summary:          str  = Field(min_length=1, description="Concise summary of this section")
+    section_heading:  Optional[str] = Field(default=None, description="Section/heading this chunk likely belongs to")
+    chunk_type:       str  = Field(default="paragraph", description="paragraph, table, list, heading, code")
+    topic:             str  = Field(default="general", description="2-3 word topic label for this chunk")
+    entities:           list[str] = Field(default_factory=list, description="Named entities mentioned in this chunk")
+    contains_data:      bool = Field(default=False, description="True if chunk has numbers, statistics, or tabular data")
+    confidence_score:   float = Field(default=0.8, ge=0.0, le=1.0, description="LLM confidence in this extraction")
+
+    @field_validator("chunk_type", mode="before")
+    @classmethod
+    def validate_chunk_type(cls, v) -> str:
+        allowed = {"paragraph", "table", "list", "heading", "code"}
+        v = str(v).strip().lower() if v else "paragraph"
+        return v if v in allowed else "paragraph"
+
+    @field_validator("summary", "topic", mode="before")
+    @classmethod
+    def clean_text_field(cls, v) -> str:
+        return " ".join(str(v).split()) if v else ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 2. SQLAlchemy Base
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -59,7 +118,7 @@ class Base(DeclarativeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. DocumentSummary table
+# 3. DocumentSummary table — with document-level metadata columns
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DocumentSummary(Base):
@@ -80,6 +139,21 @@ class DocumentSummary(Base):
     embedding_model     = Column(String(128), nullable=True)
     embedding_status    = Column(String(32), default="pending")
     embedding_stored_at = Column(DateTime(timezone=True), nullable=True)
+
+    # ── NEW — Document-level extracted metadata ───────────────────────────────
+    title                  = Column(String(512), nullable=True, index=True)
+    author                 = Column(String(256), nullable=True)
+    document_type          = Column(String(64), nullable=True, index=True)   # resume/contract/report/etc
+    domain                 = Column(String(64), nullable=True, index=True)   # legal/technical/financial/etc
+    detected_language      = Column(String(64), nullable=True)
+    key_entities            = Column(ARRAY(String), nullable=True)            # ["Avik Bhattacharya", "IIT Bombay"]
+    mentioned_dates         = Column(ARRAY(String), nullable=True)
+    target_audience         = Column(String(64), nullable=True)
+    sentiment                = Column(String(32), nullable=True)
+    confidentiality_level   = Column(String(32), nullable=True, default="public")
+    metadata_status          = Column(String(32), default="pending")          # pending/completed/failed
+    metadata_extracted_at   = Column(DateTime(timezone=True), nullable=True)
+
     created_at          = Column(DateTime(timezone=True),
                                  default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at          = Column(DateTime(timezone=True),
@@ -89,11 +163,14 @@ class DocumentSummary(Base):
     chunks = relationship("DocumentChunk", back_populates="summary",
                           cascade="all, delete-orphan")
 
-    __table_args__ = (Index("ix_doc_summaries_source_path", "source_path"),)
+    __table_args__ = (
+        Index("ix_doc_summaries_source_path", "source_path"),
+        Index("ix_doc_summaries_doc_type_domain", "document_type", "domain"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. DocumentChunk table — pgvector
+# 4. DocumentChunk table — pgvector — with chunk-level metadata columns
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DocumentChunk(Base):
@@ -114,6 +191,15 @@ class DocumentChunk(Base):
     language        = Column(String(64), default="English")
     embedding       = Column(Vector(1536), nullable=False)
     embedding_model = Column(String(128), nullable=True)
+
+    # ── NEW — Chunk-level extracted metadata ──────────────────────────────────
+    section_heading   = Column(String(512), nullable=True, index=True)   # "Introduction", "Methodology"
+    chunk_type         = Column(String(32), nullable=True, default="paragraph")  # paragraph/table/list/heading/code
+    topic               = Column(String(128), nullable=True, index=True)
+    entities             = Column(ARRAY(String), nullable=True)
+    contains_data        = Column(Boolean, default=False)
+    metadata_confidence  = Column(Float, nullable=True)   # LLM confidence in extracted metadata
+
     created_at      = Column(DateTime(timezone=True),
                              default=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -121,26 +207,21 @@ class DocumentChunk(Base):
 
     __table_args__ = (
         Index("ix_chunks_doc_hash_index", "doc_hash", "chunk_index"),
+        Index("ix_chunks_topic", "topic"),
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. ChatThread — NEW
-#    One row per conversation thread
+# 5. ChatThread
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChatThread(Base):
-    """
-    Represents a conversation thread (like a chat session).
-    One thread has many ChatMessages.
-    Title is auto-generated by LLM from first message.
-    """
     __tablename__ = "chat_threads"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    title      = Column(String(512), nullable=True)       # auto-generated by LLM
-    user_id    = Column(String(256), nullable=True)       # optional user identifier
-    doc_filter = Column(String(512), nullable=True)       # optional: filter to specific doc
+    title      = Column(String(512), nullable=True)
+    user_id    = Column(String(256), nullable=True)
+    doc_filter = Column(String(512), nullable=True)
     message_count = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True),
                         default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -148,7 +229,6 @@ class ChatThread(Base):
                         default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))
 
-    # One thread has many messages
     messages = relationship("ChatMessage", back_populates="thread",
                             cascade="all, delete-orphan",
                             order_by="ChatMessage.created_at")
@@ -162,17 +242,10 @@ class ChatThread(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. ChatMessage — NEW
-#    One row per message (human OR ai — never mixed in one row)
+# 6. ChatMessage
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChatMessage(Base):
-    """
-    One row per message.
-    role = 'human' or 'ai' — never in same row.
-    embedding stores the message vector for semantic search across chat history.
-    sources stores which document chunks were used to generate AI response.
-    """
     __tablename__ = "chat_messages"
 
     id        = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -180,19 +253,14 @@ class ChatMessage(Base):
                        ForeignKey("chat_threads.id", ondelete="CASCADE"),
                        nullable=False, index=True)
 
-    # ── Message content ───────────────────────────────────────────────────────
-    role      = Column(String(16), nullable=False)         # 'human' or 'ai'
-    content   = Column(Text, nullable=False)               # message text
+    role      = Column(String(16), nullable=False)
+    content   = Column(Text, nullable=False)
 
-    # ── Embedding — stored for semantic search across chat history ────────────
-    embedding       = Column(Vector(1536), nullable=True)  # message vector
-    embedding_model = Column(String(128), nullable=True)   # model used
+    embedding       = Column(Vector(1536), nullable=True)
+    embedding_model = Column(String(128), nullable=True)
 
-    # ── Sources — which chunks were used (AI messages only) ──────────────────
-    # Stored as JSON: [{"doc_name": "x.pdf", "chunk_index": 3, "similarity": 0.92}]
     sources   = Column(JSON, nullable=True)
 
-    # ── Token usage tracking ─────────────────────────────────────────────────
     prompt_tokens     = Column(Integer, nullable=True)
     completion_tokens = Column(Integer, nullable=True)
 

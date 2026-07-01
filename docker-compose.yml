@@ -1,8 +1,5 @@
-version: '3.8'
-
 services:
   db:
-    # pgvector image — has vector extension built in
     image: pgvector/pgvector:pg16
     container_name: avabodh_db
     restart: always
@@ -21,9 +18,10 @@ services:
       retries: 5
 
   api:
+    build: .
     image: apurbapm/avabodhai-api:latest
     container_name: avabodh_api
-    restart: always
+    restart: on-failure
     ports:
       - "8000:8000"
     environment:
@@ -54,6 +52,8 @@ services:
     volumes:
       - uploaded_files:/app/uploaded_files
       - documents:/app/documents
+    healthcheck:
+      disable: true
 
 volumes:
   postgres_data:
