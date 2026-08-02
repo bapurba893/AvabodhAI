@@ -246,6 +246,7 @@ def _make_document(html: str, url: str, title: str, elapsed: float) -> Document:
             "scraped_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "elapsed_sec": elapsed,
             "page_count":  1,
+            "raw_html": html,
         },
     )
 

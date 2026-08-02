@@ -154,6 +154,9 @@ class DocumentSummary(Base):
     metadata_status          = Column(String(32), default="pending")          # pending/completed/failed
     metadata_extracted_at   = Column(DateTime(timezone=True), nullable=True)
 
+    # ── Image tracking ────────────────────────────────────────────────────────
+    image_count             = Column(Integer, default=0)   # how many images extracted and embedded
+
     created_at          = Column(DateTime(timezone=True),
                                  default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at          = Column(DateTime(timezone=True),
@@ -192,13 +195,33 @@ class DocumentChunk(Base):
     embedding       = Column(Vector(1536), nullable=False)
     embedding_model = Column(String(128), nullable=True)
 
-    # ── NEW — Chunk-level extracted metadata ──────────────────────────────────
-    section_heading   = Column(String(512), nullable=True, index=True)   # "Introduction", "Methodology"
-    chunk_type         = Column(String(32), nullable=True, default="paragraph")  # paragraph/table/list/heading/code
+    # ── Chunk-level extracted metadata ───────────────────────────────────────
+    section_heading   = Column(String(512), nullable=True, index=True)
+    chunk_type         = Column(String(32), nullable=True, default="paragraph")
     topic               = Column(String(128), nullable=True, index=True)
     entities             = Column(ARRAY(String), nullable=True)
     contains_data        = Column(Boolean, default=False)
-    metadata_confidence  = Column(Float, nullable=True)   # LLM confidence in extracted metadata
+    metadata_confidence  = Column(Float, nullable=True)
+
+    # ── Image columns (role='image' chunks only) ──────────────────────────────
+    # role='text' for normal text chunks (default), role='image' for image chunks
+    role               = Column(String(16), nullable=False, default="text")
+    image_url          = Column(String(2048), nullable=True)   # original URL (web) or NULL (PDF)
+    image_bytes_hash   = Column(String(64),  nullable=True, index=True)  # SHA-256 of raw bytes — dedup
+    image_format       = Column(String(16),  nullable=True)   # jpeg/png/webp/gif
+    image_width        = Column(Integer,     nullable=True)
+    image_height       = Column(Integer,     nullable=True)
+    image_size_bytes   = Column(Integer,     nullable=True)
+    image_caption      = Column(Text,        nullable=True)   # full GPT-4o Vision caption
+    image_type         = Column(String(32),  nullable=True)   # chart/table/diagram/photo/screenshot/infographic/other
+    image_alt_text     = Column(Text,        nullable=True)   # HTML alt attr (web) or suggested (PDF)
+    image_context      = Column(Text,        nullable=True)   # surrounding paragraph text
+    contains_chart     = Column(Boolean,     nullable=True, default=False)
+    contains_table     = Column(Boolean,     nullable=True, default=False)
+    contains_text_img  = Column(Boolean,     nullable=True, default=False)  # infographic with embedded text
+    key_elements       = Column(ARRAY(String), nullable=True)  # ["bar chart", "Q4 label"]
+    vision_model_used  = Column(String(64),  nullable=True)   # gpt-4o
+    vision_confidence  = Column(Float,       nullable=True)   # 0.0-1.0
 
     created_at      = Column(DateTime(timezone=True),
                              default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -208,6 +231,8 @@ class DocumentChunk(Base):
     __table_args__ = (
         Index("ix_chunks_doc_hash_index", "doc_hash", "chunk_index"),
         Index("ix_chunks_topic", "topic"),
+        Index("ix_chunks_role", "role"),
+        Index("ix_chunks_image_bytes_hash", "image_bytes_hash"),
     )
 
 
