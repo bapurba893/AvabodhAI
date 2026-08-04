@@ -37,7 +37,7 @@ from pipeline.image_processor import (
     build_image_embedding_text,
     ImageCaptionOutput,
 )
-from pipeline.embedder import ImageEmbeddingInput
+from pipeline.embedder import ImageEmbeddingInput, check_image_hash_exists
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -131,6 +131,7 @@ def extract_images_from_pdf(
     summary_id: UUID,
     doc_hash:   str,
     doc_name:   str,
+    tenant_id:  str,
     source_path: str = "",
 ) -> list[ImageEmbeddingInput]:
     """
@@ -139,6 +140,10 @@ def extract_images_from_pdf(
 
     Uses pdfplumber for page-level image extraction.
     Surrounding context = text on the same page near the image.
+
+    tenant_id scopes the early dedup check (check_image_hash_exists) so a
+    letterhead/watermark image shared across another tenant's documents
+    doesn't cause this tenant's copy to be silently skipped.
 
     Returns empty list if PDF has no images or pdfplumber fails.
     """
@@ -191,8 +196,19 @@ def extract_images_from_pdf(
                             logger.debug("Skipping PDF image page=%d: %s", page_num, reason)
                             continue
 
-                        # Dedup by hash
+                        # Dedup by hash — skip the Vision API call entirely
+                        # if this exact image is already stored (e.g. a
+                        # repeated letterhead/watermark across pages)
                         img_hash = compute_image_hash(image_bytes)
+                        try:
+                            if check_image_hash_exists(img_hash, tenant_id):
+                                logger.debug(
+                                    "Skipping already-embedded PDF image on page %d (hash=%s)",
+                                    page_num, img_hash[:12],
+                                )
+                                continue
+                        except Exception as e:
+                            logger.debug("Dedup check failed, continuing anyway: %s", e)
 
                         # Caption with GPT-4o Vision
                         caption = caption_image_with_vision(

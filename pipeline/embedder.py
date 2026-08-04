@@ -64,24 +64,42 @@ def _embed_batch(texts: list[str], client: OpenAIEmbeddings) -> list[list[float]
     return client.embed_documents(texts)
 
 
-def check_embeddings_exist(doc_hash: str) -> bool:
+def check_embeddings_exist(doc_hash: str, tenant_id: str) -> bool:
+    """
+    True if TEXT chunks already exist for this doc_hash, within this
+    tenant. Filtered to role='text' so a document that (somehow) only
+    has image chunks stored doesn't cause text re-embedding to be
+    skipped, and to tenant_id so it can't be tripped by another
+    tenant's identical content.
+    """
     with get_db_session_context() as session:
         count = (
             session.query(DocumentChunk)
-            .filter(DocumentChunk.doc_hash == doc_hash)
+            .filter(
+                DocumentChunk.doc_hash == doc_hash,
+                DocumentChunk.role == "text",
+                DocumentChunk.tenant_id == tenant_id,
+            )
             .count()
         )
         return count > 0
 
 
-def check_image_hash_exists(image_bytes_hash: str) -> bool:
-    """Check if this exact image is already embedded — dedup."""
+def check_image_hash_exists(image_bytes_hash: str, tenant_id: str) -> bool:
+    """
+    Check if this exact image is already embedded for this tenant — dedup.
+    Scoped by tenant_id: if Tenant A and Tenant B both have a document
+    containing the same stock image or shared logo, Tenant B's upload
+    must NOT be skipped just because Tenant A already has that hash —
+    that would leave Tenant B's own document missing the image chunk.
+    """
     with get_db_session_context() as session:
         count = (
             session.query(DocumentChunk)
             .filter(
                 DocumentChunk.image_bytes_hash == image_bytes_hash,
                 DocumentChunk.role == "image",
+                DocumentChunk.tenant_id == tenant_id,
             )
             .count()
         )
@@ -97,18 +115,21 @@ def store_chunk_embeddings(
     summary_id: UUID,
     doc_hash: str,
     doc_name: str,
+    tenant_id: str,
     source_path: str = "",
     chunk_metadata: Optional[list[Optional[ChunkMetadataOutput]]] = None,
 ) -> dict:
     """
     Generate and store text chunk embeddings.
-    Unchanged from original — image chunks go through embed_and_store_images().
+    tenant_id is stamped onto every DocumentChunk row (denormalized from
+    the parent document) so vector_search() can filter directly without
+    a JOIN. Image chunks go through embed_and_store_images().
     """
     if not chunks:
         raise ValueError(f"No chunks provided for '{doc_name}'")
 
-    if check_embeddings_exist(doc_hash):
-        logger.info("Embeddings already exist for '%s' — skipping", doc_name)
+    if check_embeddings_exist(doc_hash, tenant_id):
+        logger.info("Embeddings already exist for tenant=%s '%s' — skipping", tenant_id, doc_name)
         return {"status": "skipped", "doc_name": doc_name, "chunk_count": 0, "elapsed_sec": 0.0}
 
     logger.info(
@@ -170,6 +191,7 @@ def store_chunk_embeddings(
 
     for validated, embedding_vector, meta in zip(validated_chunks, all_embeddings, validated_meta):
         record = DocumentChunk(
+            tenant_id           = tenant_id,
             summary_id          = summary_id,
             doc_hash            = validated.doc_hash,
             doc_name            = validated.doc_name,
@@ -196,7 +218,10 @@ def store_chunk_embeddings(
     with get_db_session_context() as session:
         session.bulk_save_objects(chunk_records)
 
-        summary = session.query(DocumentSummary).filter(DocumentSummary.id == summary_id).first()
+        summary = session.query(DocumentSummary).filter(
+            DocumentSummary.id == summary_id,
+            DocumentSummary.tenant_id == tenant_id,
+        ).first()
         if summary:
             summary.embedding_status    = "completed"
             summary.embedding_model     = settings.EMBEDDING_MODEL
@@ -255,10 +280,13 @@ def embed_and_store_images(
     images: list[ImageEmbeddingInput],
     summary_id: UUID,
     doc_name:   str,
+    tenant_id:  str,
 ) -> dict:
     """
     Embed image caption composite texts and store as DocumentChunk rows
-    with role='image'.
+    with role='image'. tenant_id is stamped onto every record and used
+    to scope the dedup check — see check_image_hash_exists() docstring
+    for why this must be per-tenant, not global.
 
     Called after image_processor.py has already:
     - filtered noise
@@ -274,11 +302,12 @@ def embed_and_store_images(
     start = time.time()
     client = _get_embeddings_client()
 
-    # Filter out already-embedded images (dedup by image_bytes_hash)
+    # Filter out already-embedded images (dedup by image_bytes_hash, per tenant)
     new_images = []
     for img in images:
-        if check_image_hash_exists(img.image_bytes_hash):
-            logger.info("Image already embedded (hash=%s) — skipping", img.image_bytes_hash[:12])
+        if check_image_hash_exists(img.image_bytes_hash, tenant_id):
+            logger.info("Image already embedded for tenant=%s (hash=%s) — skipping",
+                        tenant_id, img.image_bytes_hash[:12])
         else:
             new_images.append(img)
 
@@ -303,6 +332,7 @@ def embed_and_store_images(
 
     for img, embedding_vector in zip(new_images, all_embeddings):
         record = DocumentChunk(
+            tenant_id          = tenant_id,
             summary_id         = img.summary_id,
             doc_hash           = img.doc_hash,
             doc_name           = img.doc_name,
@@ -340,7 +370,10 @@ def embed_and_store_images(
     with get_db_session_context() as session:
         session.bulk_save_objects(image_records)
 
-        summary = session.query(DocumentSummary).filter(DocumentSummary.id == summary_id).first()
+        summary = session.query(DocumentSummary).filter(
+            DocumentSummary.id == summary_id,
+            DocumentSummary.tenant_id == tenant_id,
+        ).first()
         if summary:
             summary.image_count = (summary.image_count or 0) + len(image_records)
             session.add(summary)

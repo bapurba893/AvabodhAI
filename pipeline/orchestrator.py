@@ -58,13 +58,19 @@ class BatchReport:
         )
 
 
-def process_single_document(filepath: str) -> ProcessingResult:
+def process_single_document(filepath: str, tenant_id: str) -> ProcessingResult:
     """
     Full 7-step pipeline for one document.
     Step 7 (embeddings) runs after summary is saved.
+
+    tenant_id: this is a standalone CLI/batch tool (not behind the API
+    gateway), so there's no header to read it from — the caller (e.g.
+    process_directory, or a script) must supply it explicitly. Documents
+    bulk-loaded this way are attributed to that tenant exactly like an
+    upload through the API would be.
     """
     doc_name = os.path.basename(filepath)
-    logger.info("--- Processing: %s ---", doc_name)
+    logger.info("--- Processing: %s (tenant=%s) ---", doc_name, tenant_id)
 
     docs = None
     chunks = None
@@ -80,9 +86,9 @@ def process_single_document(filepath: str) -> ProcessingResult:
         source_path = docs[0].metadata.get("source_path", filepath)
         page_count  = len(docs)
 
-        # ── Dedup check ───────────────────────────────────────────────────
+        # ── Dedup check — scoped to this tenant ──────────────────────────────
         if file_hash:
-            existing = check_duplicate(file_hash)
+            existing = check_duplicate(file_hash, tenant_id)
             if existing:
                 return ProcessingResult(
                     filepath=filepath, doc_name=doc_name,
@@ -119,7 +125,7 @@ def process_single_document(filepath: str) -> ProcessingResult:
             "page_count":  page_count,
         }
         validated = validate_summary(raw_result, metadata)
-        record    = save_summary(validated, file_hash, chunk_count)
+        record    = save_summary(validated, file_hash, chunk_count, tenant_id=tenant_id)
 
         logger.info("Summary saved for '%s' | ID: %s", doc_name, record.id)
 
@@ -129,6 +135,7 @@ def process_single_document(filepath: str) -> ProcessingResult:
             summary_id  = record.id,
             doc_hash    = file_hash,
             doc_name    = doc_name,
+            tenant_id   = tenant_id,
             source_path = source_path,
         )
 
@@ -166,17 +173,23 @@ def process_single_document(filepath: str) -> ProcessingResult:
         )
 
 
-def process_directory(directory: str = None) -> BatchReport:
-    """Process all documents in a directory."""
+def process_directory(tenant_id: str, directory: str = None) -> BatchReport:
+    """
+    Process all documents in a directory, attributed to tenant_id.
+    tenant_id is required and required first — this is a batch-loading
+    tool, so there's no gateway header to infer it from; the operator
+    running this script must say explicitly which tenant these documents
+    belong to.
+    """
     directory = directory or settings.DOCUMENTS_DIR
     report = BatchReport()
     init_db()
 
-    logger.info("Starting batch for directory: %s", directory)
+    logger.info("Starting batch for directory: %s (tenant=%s)", directory, tenant_id)
 
     for filepath, _ in load_directory(directory):
         report.total += 1
-        result = process_single_document(filepath)
+        result = process_single_document(filepath, tenant_id)
         report.results.append(result)
 
         if result.skipped:

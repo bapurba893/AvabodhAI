@@ -53,21 +53,28 @@ def validate_summary(raw: dict, metadata: dict) -> DocumentSummaryOutput:
         raise ValueError(f"Summary output failed validation: {e}") from e
 
 
-def check_duplicate(file_hash: str) -> Optional[DocumentSummary]:
+def check_duplicate(file_hash: str, tenant_id: str) -> Optional[DocumentSummary]:
     """
-    Check if this exact file was already summarised.
+    Check if this exact file was already summarised — scoped to this
+    tenant. Deliberately scoped by (tenant_id, doc_hash) together, NOT
+    doc_hash alone: two tenants uploading the same publicly available
+    file (a vendor spec sheet, a public report) must not see each
+    other's cached summary.
     Returns the existing DB record if found, else None.
     """
     with get_db_session_context() as session:
         existing = (
             session.query(DocumentSummary)
-            .filter(DocumentSummary.doc_hash == file_hash)
+            .filter(
+                DocumentSummary.doc_hash == file_hash,
+                DocumentSummary.tenant_id == tenant_id,
+            )
             .first()
         )
         if existing:
             logger.info(
-                "Duplicate detected — '%s' already summarised (hash=%s). Skipping LLM.",
-                existing.doc_name, file_hash[:12],
+                "Duplicate detected — '%s' already summarised for tenant=%s (hash=%s). Skipping LLM.",
+                existing.doc_name, tenant_id, file_hash[:12],
             )
             session.expunge(existing)
             make_transient(existing)
@@ -104,13 +111,19 @@ def save_summary(
     validated: DocumentSummaryOutput,
     file_hash: str,
     chunk_count: int,
+    tenant_id: str,
     document_metadata: Optional[DocumentMetadataOutput] = None,
 ) -> DocumentSummary:
     """
     Step 7 — Save the structured summary to PostgreSQL.
-    - If same doc_name + hash exists → skip (already saved)
-    - If same doc_name but different hash → update (file was changed)
+    - If same tenant + hash exists → skip (already saved)
+    - If same tenant + doc_name exists but different hash → update (file was changed)
     - Otherwise → insert new row
+
+    tenant_id scopes BOTH lookups below. Without it, two tenants uploading
+    a same-named file (e.g. two different "resume.pdf") would silently
+    overwrite each other's row via the doc_name upsert path — this is the
+    sharper of the two dedup bugs closed by this change.
 
     NEW: document_metadata (if provided) is applied to the row in all paths.
 
@@ -118,24 +131,33 @@ def save_summary(
     """
     with get_db_session_context() as session:
 
-        # Check if this exact hash already in DB (full dedup)
+        # Check if this exact hash already in DB for this tenant (full dedup)
         existing = (
             session.query(DocumentSummary)
-            .filter(DocumentSummary.doc_hash == file_hash)
+            .filter(
+                DocumentSummary.doc_hash == file_hash,
+                DocumentSummary.tenant_id == tenant_id,
+            )
             .first()
         )
         if existing:
             logger.info(
-                "Record already exists for hash=%s — no DB write needed.", file_hash[:12]
+                "Record already exists for tenant=%s hash=%s — no DB write needed.",
+                tenant_id, file_hash[:12],
             )
             session.expunge(existing)
             make_transient(existing)
             return existing
 
-        # Check if same filename exists with different hash (file updated)
+        # Check if same filename exists for this tenant with different hash
+        # (file updated) — scoped by tenant_id so Tenant A's "invoice.pdf"
+        # can never match Tenant B's "invoice.pdf".
         same_name = (
             session.query(DocumentSummary)
-            .filter(DocumentSummary.doc_name == validated.doc_name)
+            .filter(
+                DocumentSummary.doc_name == validated.doc_name,
+                DocumentSummary.tenant_id == tenant_id,
+            )
             .first()
         )
 
@@ -154,7 +176,8 @@ def save_summary(
             session.add(same_name)
             session.flush()
             logger.info(
-                "Updated existing summary for '%s' (file changed)", validated.doc_name
+                "Updated existing summary for tenant=%s '%s' (file changed)",
+                tenant_id, validated.doc_name,
             )
             session.expunge(same_name)
             make_transient(same_name)
@@ -162,6 +185,7 @@ def save_summary(
 
         # New document — insert fresh row
         record = DocumentSummary(
+            tenant_id         = tenant_id,
             doc_name          = validated.doc_name,
             summary_text      = validated.summary_text,
             key_topics        = ", ".join(validated.key_topics),
@@ -181,8 +205,8 @@ def save_summary(
         session.add(record)
         session.flush()  # get the ID before session closes
         logger.info(
-            "Saved new summary for '%s' to PostgreSQL (metadata_status=%s)",
-            validated.doc_name, record.metadata_status,
+            "Saved new summary for tenant=%s '%s' to PostgreSQL (metadata_status=%s)",
+            tenant_id, validated.doc_name, record.metadata_status,
         )
         session.expunge(record)  # detach from session so it can be used outside
         make_transient(record)

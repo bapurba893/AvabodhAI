@@ -105,6 +105,8 @@ class ChatMessageResponse(BaseModel):
     created_at:   datetime
     # NEW — True when user sent an image and GPT-4o Vision was used
     image_understood: Optional[bool] = None
+    # NEW — GPT-4o Vision's caption of the attached image, if any
+    image_caption:    Optional[str]  = None
 
     @field_validator("content", mode="before")
     @classmethod
@@ -130,6 +132,7 @@ class ThreadResponse(BaseModel):
     message_count: int
     created_at:    datetime
     updated_at:    Optional[datetime]
+    tenant_id:     Optional[str] = None   # NEW — which tenant this thread belongs to
 
     class Config:
         from_attributes = True

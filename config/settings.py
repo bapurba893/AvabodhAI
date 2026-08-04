@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     DOCUMENTS_DIR: str = "./documents"
     SUPPORTED_EXTENSIONS: list[str] = [".pdf", ".txt", ".docx", ".csv"]
 
+    # ── Image pipeline (GPT-4o Vision) ─────────────────────────────────────
+    VISION_MODEL: str = "gpt-4o"
+    IMAGE_MIN_SIZE_BYTES: int = 5000       # images smaller than this are treated as noise (icons, tracking pixels)
+    IMAGE_MAX_DIMENSION: int = 1024        # resize longest side to this before sending to Vision
+    IMAGE_MAX_WORKERS: int = 4             # ThreadPoolExecutor size for parallel image embedding
+
+
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "avabodh.log"

@@ -26,7 +26,7 @@ from pipeline.scraper import scrape_url_async, scrape_website_async
 from pipeline.splitter import split_documents
 from pipeline.summariser import summarise_document
 from pipeline.storage import validate_summary, check_duplicate, save_summary
-from pipeline.embedder import store_chunk_embeddings, embed_and_store_images, ImageEmbeddingInput
+from pipeline.embedder import store_chunk_embeddings, embed_and_store_images, ImageEmbeddingInput, check_image_hash_exists
 from pipeline.image_processor import extract_images_from_soup
 from utils.logger import get_logger
 
@@ -60,6 +60,7 @@ def _wire_web_images(
             doc_hash    = doc_hash,
             source_path = page_url,
             page_text   = page_text,
+            hash_exists_fn = check_image_hash_exists,
         )
         if image_dicts:
             image_inputs = [ImageEmbeddingInput(**d) for d in image_dicts]

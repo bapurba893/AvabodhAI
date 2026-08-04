@@ -31,6 +31,10 @@ def main() -> None:
     group.add_argument("--file", type=str, help="Process a single document")
     group.add_argument("--dir",  type=str, help="Process all documents in a folder")
     group.add_argument("--check-db", action="store_true", help="Test DB connection")
+    parser.add_argument(
+        "--tenant-id", type=str, default=None,
+        help="Tenant to attribute processed documents to. Required unless --check-db.",
+    )
 
     args = parser.parse_args()
 
@@ -40,12 +44,21 @@ def main() -> None:
         print("DB connection: OK" if ok else "DB connection: FAILED")
         sys.exit(0 if ok else 1)
 
+    # This is a standalone CLI tool — no gateway header to read tenant_id
+    # from, so it must be passed explicitly. Refusing to default it to
+    # something like "default" is deliberate: a forgotten --tenant-id
+    # flag should fail loudly, not silently file documents under the
+    # wrong tenant.
+    if not args.tenant_id:
+        print("Error: --tenant-id is required (unless using --check-db)")
+        sys.exit(1)
+
     # ── Ensure tables exist ───────────────────────────────────────────────
     init_db()
 
     # ── Single file ───────────────────────────────────────────────────────
     if args.file:
-        result = process_single_document(args.file)
+        result = process_single_document(args.file, args.tenant_id)
         if result.success and not result.skipped:
             print(f"✓ Summary saved — ID: {result.summary_id}")
         elif result.skipped:
@@ -56,7 +69,7 @@ def main() -> None:
 
     # ── Directory ─────────────────────────────────────────────────────────
     else:
-        report = process_directory(args.dir)
+        report = process_directory(args.tenant_id, args.dir)
         print(
             f"\nDone — {report.succeeded} saved | "
             f"{report.skipped} skipped | {report.failed} failed"

@@ -3,7 +3,10 @@ api/routes/documents.py
 -----------------------
 All document-related API endpoints.
 
-NEW: After text embedding, extract images from PDFs and embed them too.
+Multi-tenancy: every endpoint takes tenant_id from the X-Tenant-ID header
+(via api.dependencies.get_tenant_id) and threads it through every pipeline
+call and every DB query. Nothing in this file reads or writes
+document_summaries / document_chunks without a tenant_id filter attached.
 """
 
 import os
@@ -15,6 +18,7 @@ from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from api.dependencies import get_tenant_id
 from api.schemas.document import (
     DocumentUploadResponse,
     DocumentListResponse,
@@ -61,6 +65,7 @@ def _validate_file_extension(filename: str) -> str:
 )
 async def upload_document(
     file: UploadFile = File(..., description="PDF, TXT, DOCX, or CSV file"),
+    tenant_id: str = Depends(get_tenant_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     ext = _validate_file_extension(file.filename)
@@ -69,7 +74,7 @@ async def upload_document(
     try:
         with open(temp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        logger.info("File saved: %s", file.filename)
+        logger.info("File saved: %s (tenant=%s)", file.filename, tenant_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
@@ -82,17 +87,18 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Load failed: {e}")
 
-    # ── Dedup check ───────────────────────────────────────────────────────
+    # ── Dedup check — scoped to THIS tenant only ────────────────────────────
     if file_hash:
-        existing = check_duplicate(file_hash)
+        existing = check_duplicate(file_hash, tenant_id)
         if existing:
-            logger.info("Duplicate detected for '%s'", file.filename)
+            logger.info("Duplicate detected for '%s' (tenant=%s)", file.filename, tenant_id)
             if existing.embedding_status == "pending":
                 try:
                     chunks = split_documents(docs)
                     store_chunk_embeddings(
                         chunks=chunks, summary_id=existing.id,
-                        doc_hash=file_hash, doc_name=file.filename, source_path=temp_path,
+                        doc_hash=file_hash, doc_name=file.filename,
+                        tenant_id=tenant_id, source_path=temp_path,
                     )
                 except Exception as e:
                     logger.warning("Embedding failed for existing doc: %s", e)
@@ -110,6 +116,7 @@ async def upload_document(
                     "language":     existing.language,
                     "model_used":   existing.model_used,
                     "doc_hash":     existing.doc_hash,
+                    "tenant_id":    existing.tenant_id,
                     "title":        existing.title,
                     "author":       existing.author,
                     "document_type": existing.document_type,
@@ -155,10 +162,13 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Output validation failed: {e}")
 
-    # ── Step 5: Save summary ──────────────────────────────────────────────
+    # ── Step 5: Save summary — tenant_id stamped onto the row ──────────────
     try:
-        record = save_summary(validated, file_hash, chunk_count, document_metadata=document_metadata)
-        logger.info("Saved to PostgreSQL — ID: %s", record.id)
+        record = save_summary(
+            validated, file_hash, chunk_count,
+            tenant_id=tenant_id, document_metadata=document_metadata,
+        )
+        logger.info("Saved to PostgreSQL — ID: %s (tenant=%s)", record.id, tenant_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
 
@@ -167,6 +177,7 @@ async def upload_document(
         store_chunk_embeddings(
             chunks=chunks, summary_id=record.id,
             doc_hash=file_hash, doc_name=file.filename,
+            tenant_id=tenant_id,
             source_path=temp_path, chunk_metadata=chunk_metadata,
         )
         logger.info("Text embeddings stored for '%s'", file.filename)
@@ -181,6 +192,7 @@ async def upload_document(
                 summary_id  = record.id,
                 doc_hash    = file_hash,
                 doc_name    = file.filename,
+                tenant_id   = tenant_id,
                 source_path = temp_path,
             )
             if image_inputs:
@@ -188,6 +200,7 @@ async def upload_document(
                     images     = image_inputs,
                     summary_id = record.id,
                     doc_name   = file.filename,
+                    tenant_id  = tenant_id,
                 )
                 logger.info("Image embeddings stored: %d images", len(image_inputs))
             else:
@@ -207,6 +220,7 @@ async def upload_document(
         language    = record.language,
         model_used  = record.model_used,
         doc_hash    = record.doc_hash,
+        tenant_id       = record.tenant_id,
         title           = record.title,
         author          = record.author,
         document_type   = record.document_type,
@@ -230,10 +244,14 @@ async def list_documents(
     per_page: int = Query(default=10, ge=1, le=100),
     document_type: Optional[str] = Query(default=None),
     domain:        Optional[str] = Query(default=None),
+    tenant_id: str = Depends(get_tenant_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     offset = (page - 1) * per_page
-    query = db.query(DocumentSummary)
+    # Every list is scoped to the caller's tenant — this is the query that
+    # would leak every other tenant's document titles/summaries if the
+    # filter were ever dropped.
+    query = db.query(DocumentSummary).filter(DocumentSummary.tenant_id == tenant_id)
     if document_type:
         query = query.filter(DocumentSummary.document_type == document_type.lower())
     if domain:
@@ -260,8 +278,19 @@ async def list_documents(
 
 
 @router.get("/{doc_id}", response_model=DocumentDetailResponse, summary="Get full summary by ID")
-async def get_document(doc_id: uuid.UUID, db: Session = Depends(get_db_session_fastapi)):
-    record = db.query(DocumentSummary).filter(DocumentSummary.id == doc_id).first()
+async def get_document(
+    doc_id: uuid.UUID,
+    tenant_id: str = Depends(get_tenant_id),
+    db: Session = Depends(get_db_session_fastapi),
+):
+    # Filtered by id AND tenant_id together — a Tenant A user guessing or
+    # reusing a Tenant B document UUID gets the same 404 as a nonexistent
+    # ID, never a distinguishable "exists but isn't yours" response.
+    record = (
+        db.query(DocumentSummary)
+        .filter(DocumentSummary.id == doc_id, DocumentSummary.tenant_id == tenant_id)
+        .first()
+    )
     if not record:
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     return DocumentDetailResponse(
@@ -269,6 +298,7 @@ async def get_document(doc_id: uuid.UUID, db: Session = Depends(get_db_session_f
         key_topics=record.key_topics, page_count=record.page_count or 0,
         chunk_count=record.chunk_count or 0, source_path=record.source_path,
         language=record.language, model_used=record.model_used, doc_hash=record.doc_hash,
+        tenant_id=record.tenant_id,
         title=record.title, author=record.author,
         document_type=record.document_type, domain=record.domain,
         key_entities=record.key_entities, mentioned_dates=record.mentioned_dates,
@@ -283,9 +313,14 @@ async def get_document(doc_id: uuid.UUID, db: Session = Depends(get_db_session_f
 @router.patch("/{doc_id}", response_model=DocumentUpdateResponse, summary="Update document name")
 async def update_document(
     doc_id: uuid.UUID, payload: DocumentUpdateRequest,
+    tenant_id: str = Depends(get_tenant_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
-    record = db.query(DocumentSummary).filter(DocumentSummary.id == doc_id).first()
+    record = (
+        db.query(DocumentSummary)
+        .filter(DocumentSummary.id == doc_id, DocumentSummary.tenant_id == tenant_id)
+        .first()
+    )
     if not record:
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
     record.doc_name = payload.doc_name
@@ -295,10 +330,20 @@ async def update_document(
 
 
 @router.delete("/{doc_id}", response_model=DeleteResponse, summary="Delete a document summary")
-async def delete_document(doc_id: uuid.UUID, db: Session = Depends(get_db_session_fastapi)):
-    record = db.query(DocumentSummary).filter(DocumentSummary.id == doc_id).first()
+async def delete_document(
+    doc_id: uuid.UUID,
+    tenant_id: str = Depends(get_tenant_id),
+    db: Session = Depends(get_db_session_fastapi),
+):
+    record = (
+        db.query(DocumentSummary)
+        .filter(DocumentSummary.id == doc_id, DocumentSummary.tenant_id == tenant_id)
+        .first()
+    )
     if not record:
         raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
+    # document_chunks cascade-deletes automatically via the DB-level
+    # ON DELETE CASCADE on DocumentChunk.summary_id — no orphaned vectors.
     db.delete(record)
     db.commit()
     return DeleteResponse(id=doc_id)

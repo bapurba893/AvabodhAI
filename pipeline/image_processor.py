@@ -36,12 +36,13 @@ settings = get_settings()
 # ── Constants ────────────────────────────────────────────────────────────────
 
 # Images smaller than this are noise (icons, tracking pixels, spacers)
-_MIN_SIZE_BYTES  = 5_000       # 5KB
+# Sourced from settings so it's configurable via .env — falls back to sane defaults.
+_MIN_SIZE_BYTES  = getattr(settings, "IMAGE_MIN_SIZE_BYTES", 5_000)   # 5KB
 _MIN_DIMENSION   = 50          # 50px width or height
 
 # Resize large images before Vision API call — saves tokens
 # GPT-4o detail="auto": tiles ≤2048px; detail="low": fixed 512px
-_MAX_DIMENSION   = 1024        # resize to this if larger
+_MAX_DIMENSION   = getattr(settings, "IMAGE_MAX_DIMENSION", 1024)     # resize to this if larger
 
 # CSS class / ID patterns that indicate UI chrome to skip
 _NOISE_PATTERNS  = re.compile(
@@ -50,7 +51,7 @@ _NOISE_PATTERNS  = re.compile(
     re.IGNORECASE,
 )
 
-VISION_MODEL = "gpt-4o"   # sees actual pixels, reads charts, diagrams, text
+VISION_MODEL = getattr(settings, "VISION_MODEL", "gpt-4o")   # sees actual pixels, reads charts, diagrams, text
 
 
 # ── Pydantic output schema ───────────────────────────────────────────────────
@@ -176,19 +177,47 @@ Important:
 - Be precise and factual, not generic"""
 
 
+def _fallback_caption_from_alt_text(alt_text: str) -> Optional[ImageCaptionOutput]:
+    """
+    Build a low-confidence ImageCaptionOutput from HTML alt text when
+    GPT-4o Vision is unavailable or the call fails. Better than dropping
+    the image entirely — it still gets embedded and is findable by search,
+    just with less rich signal than an actual Vision caption.
+    """
+    alt_text = (alt_text or "").strip()
+    if not alt_text:
+        return None
+    try:
+        return ImageCaptionOutput(
+            caption=alt_text,
+            image_type="other",
+            contains_chart=False,
+            contains_table=False,
+            contains_text=False,
+            key_elements=[],
+            suggested_alt_text=alt_text[:125],
+            confidence=0.3,   # low confidence — this is alt text, not actual Vision analysis
+        )
+    except Exception:
+        return None
+
+
 def caption_image_with_vision(
     image_bytes:    bytes,
     surrounding_text: str = "",
+    alt_text:       str = "",
 ) -> Optional[ImageCaptionOutput]:
     """
     Call GPT-4o Vision and return structured ImageCaptionOutput.
-    Returns None if Vision call fails (non-fatal — image skipped).
+    If the Vision call fails and alt_text is available, falls back to a
+    low-confidence caption built from alt_text instead of dropping the
+    image entirely. Returns None only if there's nothing usable at all.
     """
     try:
         b64, fmt, width, height, media_type = prepare_image_for_vision(image_bytes)
     except Exception as e:
         logger.warning("Image preparation failed: %s", e)
-        return None
+        return _fallback_caption_from_alt_text(alt_text)
 
     # Build context hint if surrounding text provided
     context_hint = ""
@@ -237,18 +266,27 @@ def caption_image_with_vision(
 
     except Exception as e:
         logger.warning("GPT-4o Vision call failed: %s", e)
-        return None
+        return _fallback_caption_from_alt_text(alt_text)
 
 
 # ── Download image from URL (web scraping mode) ──────────────────────────────
 
-def download_image(url: str, timeout: int = 10) -> Optional[bytes]:
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; AvabodhAI/1.0; +https://github.com/bapurba893/AvabodhAI) "
+        "ImageFetcher/1.0"
+    )
+}
+
+
+def download_image(url: str, timeout: int = 15) -> Optional[bytes]:
     """
     Download image bytes from a URL.
+    Sends a browser-like User-Agent — some sites 403 on the default httpx UA.
     Returns None on failure (non-fatal).
     """
     try:
-        resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+        resp = httpx.get(url, timeout=timeout, follow_redirects=True, headers=_DOWNLOAD_HEADERS)
         if resp.status_code == 200:
             return resp.content
         logger.warning("Image download failed %s: HTTP %d", url, resp.status_code)
@@ -296,6 +334,7 @@ def extract_images_from_soup(
     doc_hash:   str,
     source_path: str = "",
     page_text:  str = "",
+    hash_exists_fn=None,
 ) -> list:
     """
     Extract, download, caption, and prepare images found in BeautifulSoup HTML.
@@ -305,6 +344,12 @@ def extract_images_from_soup(
     Import ImageEmbeddingInput from pipeline.embedder where needed to avoid
     circular imports — this function returns plain dicts that the caller
     converts to ImageEmbeddingInput.
+
+    hash_exists_fn: optional callable(image_bytes_hash) -> bool. When provided
+    (pass pipeline.embedder.check_image_hash_exists from the caller — kept as
+    an injected callable here to avoid a circular import with embedder.py),
+    images already stored in the DB are skipped BEFORE the Vision API call,
+    saving cost on pages that reuse the same logo/banner/diagram repeatedly.
     """
     from urllib.parse import urljoin, urlparse
     results = []
@@ -366,10 +411,21 @@ def extract_images_from_soup(
 
             img_hash = compute_image_hash(image_bytes)
 
-            # Caption with GPT-4o Vision
+            # Early dedup — skip the Vision API call entirely for images
+            # already stored (e.g. a site header logo repeated on every page)
+            if hash_exists_fn is not None:
+                try:
+                    if hash_exists_fn(img_hash):
+                        logger.debug("Skipping already-embedded image (hash=%s)", img_hash[:12])
+                        continue
+                except Exception as e:
+                    logger.debug("hash_exists_fn check failed, continuing anyway: %s", e)
+
+            # Caption with GPT-4o Vision (falls back to alt_text if the call fails)
             caption = caption_image_with_vision(
                 image_bytes=image_bytes,
                 surrounding_text=surrounding,
+                alt_text=alt_text,
             )
             if caption is None:
                 continue

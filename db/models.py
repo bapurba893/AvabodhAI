@@ -125,6 +125,9 @@ class DocumentSummary(Base):
     __tablename__ = "document_summaries"
 
     id                  = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # ── Multi-tenancy — REQUIRED on every row, set from the X-Tenant-ID
+    # header at write time. Every read in this app must filter on this. ──
+    tenant_id           = Column(String(128), nullable=False, index=True)
     doc_name            = Column(String(512), nullable=False, index=True)
     summary_text        = Column(Text, nullable=False)
     key_topics          = Column(Text, nullable=True)
@@ -169,6 +172,10 @@ class DocumentSummary(Base):
     __table_args__ = (
         Index("ix_doc_summaries_source_path", "source_path"),
         Index("ix_doc_summaries_doc_type_domain", "document_type", "domain"),
+        # NEW — tenant-scoped dedup lookups (check_duplicate / same_name upsert
+        # in pipeline/storage.py) hit these directly.
+        Index("ix_doc_summaries_tenant_hash", "tenant_id", "doc_hash"),
+        Index("ix_doc_summaries_tenant_name", "tenant_id", "doc_name"),
     )
 
 
@@ -180,6 +187,11 @@ class DocumentChunk(Base):
     __tablename__ = "document_chunks"
 
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # ── Multi-tenancy — denormalized from the parent DocumentSummary at
+    # insert time. Filtering here directly (rather than joining through
+    # summary_id) keeps the pgvector similarity query fast and simple:
+    # WHERE tenant_id = :tenant_id ORDER BY embedding <=> :vector ──────────
+    tenant_id       = Column(String(128), nullable=False, index=True)
     summary_id      = Column(UUID(as_uuid=True),
                              ForeignKey("document_summaries.id", ondelete="CASCADE"),
                              nullable=False, index=True)
@@ -233,6 +245,12 @@ class DocumentChunk(Base):
         Index("ix_chunks_topic", "topic"),
         Index("ix_chunks_role", "role"),
         Index("ix_chunks_image_bytes_hash", "image_bytes_hash"),
+        # NEW — every retrieval query filters WHERE tenant_id = ... first;
+        # pairing it with role covers the most common query shape directly
+        # (role_filter + tenant_id together, as used by vector_search()).
+        Index("ix_chunks_tenant_role", "tenant_id", "role"),
+        # NEW — tenant-scoped image dedup (check_image_hash_exists)
+        Index("ix_chunks_tenant_image_hash", "tenant_id", "image_bytes_hash"),
     )
 
 
@@ -244,6 +262,9 @@ class ChatThread(Base):
     __tablename__ = "chat_threads"
 
     id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # ── Multi-tenancy — same rule as documents: every thread belongs to
+    # exactly one tenant, set from X-Tenant-ID when the thread is created. ──
+    tenant_id  = Column(String(128), nullable=False, index=True)
     title      = Column(String(512), nullable=True)
     user_id    = Column(String(256), nullable=True)
     doc_filter = Column(String(512), nullable=True)
@@ -260,6 +281,8 @@ class ChatThread(Base):
 
     __table_args__ = (
         Index("ix_chat_threads_user_id", "user_id"),
+        # NEW — thread list/get/patch/delete all filter WHERE tenant_id = ...
+        Index("ix_chat_threads_tenant_user", "tenant_id", "user_id"),
     )
 
     def __repr__(self) -> str:
@@ -274,6 +297,10 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id        = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # ── Multi-tenancy — denormalized from the parent ChatThread. Matters
+    # most for the /chat/search semantic-search-over-history endpoint,
+    # which queries chat_messages directly and must not cross tenants. ────
+    tenant_id = Column(String(128), nullable=False, index=True)
     thread_id = Column(UUID(as_uuid=True),
                        ForeignKey("chat_threads.id", ondelete="CASCADE"),
                        nullable=False, index=True)
@@ -286,6 +313,10 @@ class ChatMessage(Base):
 
     sources   = Column(JSON, nullable=True)
 
+    # ── NEW — multimodal chat (image attached to this turn) ────────────────
+    has_image     = Column(Boolean, nullable=False, default=False)
+    image_caption = Column(Text, nullable=True)   # GPT-4o Vision caption of the attached image
+
     prompt_tokens     = Column(Integer, nullable=True)
     completion_tokens = Column(Integer, nullable=True)
 
@@ -296,6 +327,8 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("ix_chat_messages_thread_role", "thread_id", "role"),
+        # NEW — GET /chat/search filters WHERE tenant_id = ... directly
+        Index("ix_chat_messages_tenant", "tenant_id"),
     )
 
     def __repr__(self) -> str:

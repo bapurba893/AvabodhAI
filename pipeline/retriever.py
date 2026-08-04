@@ -40,50 +40,74 @@ def embed_query(query: str) -> list[float]:
 def vector_search(
     query_vector: list[float],
     db: Session,
+    tenant_id: str,
     top_k: int = 10,
     doc_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
 ) -> list[dict]:
     """
     Search document_chunks table using pgvector cosine similarity.
     Returns top_k most similar chunks with similarity scores.
+
+    tenant_id is REQUIRED (not optional, no default) and is always applied
+    to the WHERE clause — this is the one place in the app where a
+    cross-tenant document leak would happen if it were forgotten, so the
+    function signature makes it impossible to call without one.
+
+    role_filter: 'text' | 'image' | None (None = search both — this is how
+    a text-only query still surfaces relevant image captions automatically,
+    since image captions live in the same table with the same embedding model).
+
+    Each result dict now also carries role/image_type/image_caption/
+    section_heading/topic/chunk_type so callers (memory.py prompt building,
+    chat.py source attribution) can tell text chunks and image chunks apart
+    and render them differently.
     """
+    where_clauses = ["tenant_id = :tenant_id"]
+    params: dict = {"vector": str(query_vector), "top_k": top_k, "tenant_id": tenant_id}
+
+    if doc_filter:
+        where_clauses.append("doc_name = :doc_filter")
+        params["doc_filter"] = doc_filter
+
+    if role_filter:
+        where_clauses.append("role = :role_filter")
+        params["role_filter"] = role_filter
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}"
+
+    query = text(f"""
+        SELECT id, doc_name, chunk_index, chunk_text,
+               chunk_size, page_number, doc_hash,
+               role, image_type, image_caption, image_url,
+               section_heading, topic, chunk_type,
+               1 - (embedding <=> CAST(:vector AS vector)) AS similarity
+        FROM document_chunks
+        {where_sql}
+        ORDER BY embedding <=> CAST(:vector AS vector)
+        LIMIT :top_k
+    """)
+
     try:
-        if doc_filter:
-            results = db.execute(
-                text("""
-                    SELECT id, doc_name, chunk_index, chunk_text,
-                           chunk_size, page_number, doc_hash,
-                           1 - (embedding <=> CAST(:vector AS vector)) AS similarity
-                    FROM document_chunks
-                    WHERE doc_name = :doc_filter
-                    ORDER BY embedding <=> CAST(:vector AS vector)
-                    LIMIT :top_k
-                """),
-                {"vector": str(query_vector), "doc_filter": doc_filter, "top_k": top_k}
-            ).fetchall()
-        else:
-            results = db.execute(
-                text("""
-                    SELECT id, doc_name, chunk_index, chunk_text,
-                           chunk_size, page_number, doc_hash,
-                           1 - (embedding <=> CAST(:vector AS vector)) AS similarity
-                    FROM document_chunks
-                    ORDER BY embedding <=> CAST(:vector AS vector)
-                    LIMIT :top_k
-                """),
-                {"vector": str(query_vector), "top_k": top_k}
-            ).fetchall()
+        results = db.execute(query, params).fetchall()
 
         return [
             {
-                "id":          str(r.id),
-                "doc_name":    r.doc_name,
-                "chunk_index": r.chunk_index,
-                "chunk_text":  r.chunk_text,
-                "chunk_size":  r.chunk_size,
-                "page_number": r.page_number,
-                "doc_hash":    r.doc_hash,
-                "similarity":  round(float(r.similarity), 4),
+                "id":              str(r.id),
+                "doc_name":        r.doc_name,
+                "chunk_index":     r.chunk_index,
+                "chunk_text":      r.chunk_text,
+                "chunk_size":      r.chunk_size,
+                "page_number":     r.page_number,
+                "doc_hash":        r.doc_hash,
+                "role":            r.role or "text",
+                "image_type":      r.image_type,
+                "image_caption":   r.image_caption,
+                "image_url":       r.image_url,
+                "section_heading": r.section_heading,
+                "topic":           r.topic,
+                "chunk_type":      r.chunk_type,
+                "similarity":      round(float(r.similarity), 4),
             }
             for r in results
         ]
@@ -109,6 +133,16 @@ def contextual_compression(
     if not chunks:
         return []
 
+    # Image chunks are already a dense, purpose-built caption — running them
+    # through an LLM sentence-extractor tends to mangle or drop the caption,
+    # so only text chunks go through compression. Image chunks pass straight
+    # through untouched, keeping their full caption intact.
+    text_chunks  = [c for c in chunks if c.get("role", "text") == "text"]
+    image_chunks = [c for c in chunks if c.get("role") == "image"]
+
+    if not text_chunks:
+        return image_chunks
+
     # Convert to LangChain Documents for compression
     docs = [
         Document(
@@ -118,9 +152,10 @@ def contextual_compression(
                 "chunk_index": c["chunk_index"],
                 "similarity":  c["similarity"],
                 "id":          c["id"],
+                "role":        c.get("role", "text"),
             }
         )
-        for c in chunks
+        for c in text_chunks
     ]
 
     try:
@@ -132,18 +167,16 @@ def contextual_compression(
         compressor = LLMChainExtractor.from_llm(llm)
         compressed_docs = compressor.compress_documents(docs, query)
 
-        # Map compressed docs back to original chunk metadata
+        # Map compressed docs back to original chunk metadata.
+        # Match by id (unique per row) — chunk_index alone isn't safe because
+        # text and image chunks are each independently 0-indexed per document,
+        # so a text chunk_index=0 and an image chunk_index=0 can collide.
+        by_id = {c["id"]: c for c in text_chunks}
         compressed_chunks = []
         for doc in compressed_docs:
             if not doc.page_content.strip():
                 continue
-            # Find original chunk to preserve metadata
-            original = next(
-                (c for c in chunks
-                 if c["chunk_index"] == doc.metadata.get("chunk_index")
-                 and c["doc_name"] == doc.metadata.get("doc_name")),
-                None
-            )
+            original = by_id.get(doc.metadata.get("id"))
             if original:
                 compressed_chunks.append({
                     **original,
@@ -151,27 +184,37 @@ def contextual_compression(
                     "compressed": True,
                 })
 
+        if not compressed_chunks:
+            compressed_chunks = text_chunks[:3]
+
+        # Merge image chunks back in untouched, re-sort by similarity
+        merged = compressed_chunks + image_chunks
+        merged.sort(key=lambda c: c.get("similarity", 0), reverse=True)
+
         logger.info(
-            "Compression: %d chunks -> %d after filtering",
-            len(chunks), len(compressed_chunks)
+            "Compression: %d chunks -> %d text (+%d image) after filtering",
+            len(text_chunks), len(compressed_chunks), len(image_chunks),
         )
-        return compressed_chunks if compressed_chunks else chunks[:3]
+        return merged
 
     except Exception as e:
         logger.warning("Contextual compression failed — using raw chunks: %s", e)
-        return chunks[:5]
+        return (text_chunks[:5] + image_chunks)
 
 
 def retrieve(
     query: str,
     db: Session,
+    tenant_id: str,
     top_k: int = 5,
     doc_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
 ) -> list[dict]:
     """
     Full retrieval pipeline:
     1. Embed query
-    2. Vector search
+    2. Vector search (both text and image chunks, unless role_filter narrows it) —
+       always scoped to tenant_id
     3. Contextual compression
     Returns final list of relevant chunks.
     """
@@ -182,8 +225,10 @@ def retrieve(
     raw_chunks = vector_search(
         query_vector=query_vector,
         db=db,
+        tenant_id=tenant_id,
         top_k=top_k * 2,    # get 2x so compression has room to filter
         doc_filter=doc_filter,
+        role_filter=role_filter,
     )
 
     if not raw_chunks:

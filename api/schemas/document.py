@@ -23,6 +23,7 @@ class DocumentUploadResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
+    tenant_id:    Optional[str] = None   # NEW — which tenant this document belongs to
     title:                  Optional[str] = None
     author:                 Optional[str] = None
     document_type:          Optional[str] = None
@@ -76,6 +77,7 @@ class DocumentDetailResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
+    tenant_id:    Optional[str] = None   # NEW — which tenant this document belongs to
     title:                  Optional[str] = None
     author:                 Optional[str] = None
     document_type:          Optional[str] = None

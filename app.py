@@ -155,6 +155,20 @@ with st.sidebar:
     st.markdown("Document Intelligence Platform")
     st.divider()
 
+    # NEW — tenant_id. This UI has no gateway in front of it, so there's
+    # no header to read it from; the operator types it in directly. Every
+    # document processed in this session is attributed to this tenant.
+    tenant_id = st.text_input(
+        "Tenant ID",
+        value=st.session_state.get("tenant_id", ""),
+        help="Documents processed in this session are scoped to this tenant.",
+    )
+    st.session_state["tenant_id"] = tenant_id
+    if not tenant_id.strip():
+        st.warning("Enter a Tenant ID above to process or view documents.")
+
+    st.divider()
+
     # New Document button — taken from reference code's "New Chat" pattern
     if st.button("+ New Document", use_container_width=True):
         new_document()
@@ -169,11 +183,12 @@ with st.sidebar:
 
     st.markdown("#### Previously Processed")
 
-    if st.session_state.get("db_ready"):
+    if st.session_state.get("db_ready") and tenant_id.strip():
         try:
             with get_db_session() as session:
                 records = (
                     session.query(DocumentSummary)
+                    .filter(DocumentSummary.tenant_id == tenant_id)
                     .order_by(DocumentSummary.created_at.desc())
                     .limit(20)
                     .all()
@@ -230,9 +245,11 @@ with col_upload:
 
     process_btn = st.button(
         "Generate Summary",
-        disabled=uploaded_file is None,
+        disabled=uploaded_file is None or not tenant_id.strip(),
         use_container_width=True,
     )
+    if uploaded_file is not None and not tenant_id.strip():
+        st.caption("⚠️ Enter a Tenant ID in the sidebar before processing.")
 
     if process_btn and uploaded_file:
         temp_path = os.path.join("documents", uploaded_file.name)
@@ -258,7 +275,7 @@ with col_upload:
 
             # Dedup check
             if file_hash:
-                existing = check_duplicate(file_hash)
+                existing = check_duplicate(file_hash, tenant_id)
                 if existing:
                     status.update(label="Already processed — showing cached result",
                                   state="complete")
@@ -314,7 +331,7 @@ with col_upload:
                     "page_count":  page_count,
                 }
                 validated = validate_summary(raw_result, metadata)
-                record = save_summary(validated, file_hash, chunk_count)
+                record = save_summary(validated, file_hash, chunk_count, tenant_id=tenant_id)
                 st.write(f"Saved — ID: {str(record.id)[:8]}...")
             except Exception as e:
                 status.update(label="Failed at saving", state="error")
