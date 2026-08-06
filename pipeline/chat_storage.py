@@ -55,7 +55,7 @@ def create_thread(
     doc_filter: Optional[str] = None,
 ) -> ChatThread:
     """Create a new chat thread, stamped with tenant_id + org_unit_id, and return it."""
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         thread = ChatThread(
             tenant_id = tenant_id,
             org_unit_id = org_unit_id,
@@ -73,7 +73,7 @@ def create_thread(
 
 def update_thread_title(thread_id: str, tenant_id: str, org_unit_id: str, title: str) -> None:
     """Update thread title — called after first message. Scoped to tenant+org_unit."""
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         thread = session.query(ChatThread).filter(
             ChatThread.id == uuid.UUID(thread_id),
             ChatThread.tenant_id == tenant_id,
@@ -88,7 +88,7 @@ def update_thread_title(thread_id: str, tenant_id: str, org_unit_id: str, title:
 
 def increment_message_count(thread_id: str, tenant_id: str, org_unit_id: str) -> None:
     """Increment message counter on thread. Scoped to tenant+org_unit."""
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         thread = session.query(ChatThread).filter(
             ChatThread.id == uuid.UUID(thread_id),
             ChatThread.tenant_id == tenant_id,
@@ -112,7 +112,7 @@ def save_human_message(
     """
     embedding = _embed_text(content)
 
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         msg = ChatMessage(
             tenant_id       = tenant_id,
             org_unit_id     = org_unit_id,
@@ -152,7 +152,7 @@ def save_ai_message(
     """
     embedding = _embed_text(content)
 
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         msg = ChatMessage(
             tenant_id         = tenant_id,
             org_unit_id       = org_unit_id,

@@ -61,11 +61,22 @@ class TenantGuardMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path
+        tenant_id = request.headers.get("x-tenant-id", "").strip() or None
+        org_unit_id = request.headers.get("x-org-unit-id", "").strip() or None
+
+        # Stashed here so db.get_db_session_fastapi() can read it and set
+        # the Postgres RLS session context — this is the ONE place both
+        # headers get parsed, so every downstream consumer (dependencies,
+        # DB session) reads the same values from request.state instead of
+        # re-parsing headers themselves.
+        request.state.tenant_id = tenant_id
+        request.state.org_unit_id = org_unit_id
+
         if path not in _EXEMPT_PATHS and not path.startswith("/health") and not _is_signed_file_link(path):
             missing = []
-            if not request.headers.get("x-tenant-id", "").strip():
+            if not tenant_id:
                 missing.append("X-Tenant-ID")
-            if not request.headers.get("x-org-unit-id", "").strip():
+            if not org_unit_id:
                 missing.append("X-Org-Unit-ID")
             if missing:
                 logger.warning("Rejected request missing %s: %s %s", missing, request.method, path)

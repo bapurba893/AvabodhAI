@@ -1,7 +1,13 @@
 """
 api/routes/search.py
 --------------------
-Semantic search endpoint using pgvector.
+Semantic + keyword + hybrid search endpoint using pgvector and Postgres
+full-text search together.
+
+search_mode controls which of the two underlying search types run:
+  - "hybrid"   (default) — both, merged via Reciprocal Rank Fusion
+  - "semantic" — vector similarity only
+  - "keyword"  — exact keyword match only (chunk_tsvector)
 
 Role-aware search — a query can be scoped to text chunks only, image
 chunks only, or both (default). Image chunks surface their caption/type
@@ -10,10 +16,12 @@ from text results.
 
 Multi-tenancy + department isolation: both endpoints take tenant_id AND
 org_unit_id from the X-Tenant-ID / X-Org-Unit-ID headers and apply both
-as mandatory filters, together — this is a search endpoint, exactly the
-kind of query that would leak another tenant's, or another department's,
-document content if either filter were ever dropped. is_ground_truth is
-always applied too, unconditionally, same as every other retrieval path.
+as mandatory filters, together, on EVERY search path (semantic, keyword,
+and hybrid alike) — this is a search endpoint, exactly the kind of query
+that would leak another tenant's, or another department's, document
+content if either filter were ever dropped on any one of the three
+paths. is_ground_truth is always applied too, unconditionally, same as
+every other retrieval path.
 """
 
 import uuid
@@ -27,7 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from api.dependencies import get_tenant_id, get_org_unit_id
 from db.database import get_db_session_fastapi
 from db.models import DocumentChunk
-from pipeline.retriever import embed_query
+from pipeline.retriever import embed_query, vector_search, keyword_search, hybrid_search
 from config.settings import get_settings
 from utils.logger import get_logger
 
@@ -36,16 +44,20 @@ logger = get_logger(__name__)
 settings = get_settings()
 
 _ALLOWED_ROLES = {"text", "image"}
+_ALLOWED_MODES = {"hybrid", "semantic", "keyword"}
 
 
 class SearchRequest(BaseModel):
     query:    str = Field(min_length=1, description="Search query")
     top_k:    int = Field(default=5, ge=1, le=20, description="Number of results")
     doc_name: Optional[str] = Field(default=None, description="Filter by document name (optional)")
-    # Scope search to text chunks, image chunks, or both (default None = both)
     role:     Optional[str] = Field(
         default=None,
         description="Filter by chunk role: 'text' or 'image'. Omit to search both.",
+    )
+    search_mode: str = Field(
+        default="hybrid",
+        description="'hybrid' (semantic + keyword, merged via RRF), 'semantic' (vector only), or 'keyword' (exact match only, via Postgres full-text search).",
     )
 
     @field_validator("role")
@@ -58,6 +70,14 @@ class SearchRequest(BaseModel):
             raise ValueError(f"role must be one of {sorted(_ALLOWED_ROLES)}")
         return v
 
+    @field_validator("search_mode")
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in _ALLOWED_MODES:
+            raise ValueError(f"search_mode must be one of {sorted(_ALLOWED_MODES)}")
+        return v
+
 
 class ChunkResult(BaseModel):
     id:          str
@@ -67,6 +87,8 @@ class ChunkResult(BaseModel):
     chunk_size:  int
     page_number: Optional[int] = None
     similarity:  float
+    search_type: Optional[str] = None          # NEW — 'semantic' or 'keyword', which engine found this result
+    matched_by:  Optional[list[str]] = None    # NEW — hybrid mode only: which engine(s) found it. Both = strongest signal.
     role:            str = "text"
     image_type:      Optional[str] = None
     image_caption:   Optional[str] = None
@@ -76,12 +98,13 @@ class ChunkResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    query:   str
-    results: list[ChunkResult]
-    total:   int
+    query:       str
+    search_mode: str
+    results:     list[ChunkResult]
+    total:       int
 
 
-@router.post("/", response_model=SearchResponse, summary="Semantic search across documents")
+@router.post("/", response_model=SearchResponse, summary="Semantic, keyword, or hybrid search across documents")
 async def semantic_search(
     payload: SearchRequest,
     tenant_id: str = Depends(get_tenant_id),
@@ -89,67 +112,47 @@ async def semantic_search(
     db: Session = Depends(get_db_session_fastapi),
 ):
     """
-    Find most relevant chunks for a query using vector similarity.
-    By default searches BOTH text and image chunks — pass role='text' or
-    role='image' to scope the search to just one kind. Always scoped to
-    the caller's tenant_id + org_unit_id, and always ground-truth-only.
+    Find most relevant chunks for a query. Defaults to hybrid (semantic +
+    keyword, merged via Reciprocal Rank Fusion) — pass search_mode to
+    narrow to just one engine. By default searches BOTH text and image
+    chunks — pass role='text' or role='image' to scope to just one kind.
+    Always scoped to the caller's tenant_id + org_unit_id, and always
+    ground-truth-only.
     """
     try:
-        query_vector = embed_query(payload.query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding query failed: {e}")
+        common = dict(
+            db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
+            top_k=payload.top_k, doc_filter=payload.doc_name, role_filter=payload.role,
+        )
 
-    where_clauses = [
-        "tenant_id = :tenant_id",
-        "org_unit_id = :org_unit_id",
-        "is_ground_truth = true",
-    ]
-    params: dict = {
-        "vector": str(query_vector), "top_k": payload.top_k,
-        "tenant_id": tenant_id, "org_unit_id": org_unit_id,
-    }
+        if payload.search_mode == "semantic":
+            query_vector = embed_query(payload.query)
+            results = vector_search(query_vector=query_vector, **common)
+        elif payload.search_mode == "keyword":
+            results = keyword_search(query_text=payload.query, **common)
+        else:  # hybrid
+            results = hybrid_search(query_text=payload.query, **common)
 
-    if payload.doc_name:
-        where_clauses.append("doc_name = :doc_name")
-        params["doc_name"] = payload.doc_name
-
-    if payload.role:
-        where_clauses.append("role = :role")
-        params["role"] = payload.role
-
-    where_sql = f"WHERE {' AND '.join(where_clauses)}"
-
-    try:
-        results = db.execute(
-            text(f"""
-                SELECT id, doc_name, chunk_index, chunk_text, chunk_size,
-                       page_number, role, image_type, image_caption,
-                       section_heading, topic, chunk_type,
-                       1 - (embedding <=> CAST(:vector AS vector)) as similarity
-                FROM document_chunks
-                {where_sql}
-                ORDER BY embedding <=> CAST(:vector AS vector)
-                LIMIT :top_k
-            """),
-            params,
-        ).fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {e}")
 
     return SearchResponse(
         query=payload.query,
+        search_mode=payload.search_mode,
         results=[
             ChunkResult(
-                id=str(r.id), doc_name=r.doc_name,
-                chunk_index=r.chunk_index, chunk_text=r.chunk_text,
-                chunk_size=r.chunk_size, page_number=r.page_number,
-                similarity=round(float(r.similarity), 4),
-                role=r.role or "text",
-                image_type=r.image_type,
-                image_caption=r.image_caption,
-                section_heading=r.section_heading,
-                topic=r.topic,
-                chunk_type=r.chunk_type,
+                id=r["id"], doc_name=r["doc_name"],
+                chunk_index=r["chunk_index"], chunk_text=r["chunk_text"],
+                chunk_size=r["chunk_size"], page_number=r["page_number"],
+                similarity=r["similarity"],
+                search_type=r.get("search_type"),
+                matched_by=r.get("matched_by"),
+                role=r.get("role") or "text",
+                image_type=r.get("image_type"),
+                image_caption=r.get("image_caption"),
+                section_heading=r.get("section_heading"),
+                topic=r.get("topic"),
+                chunk_type=r.get("chunk_type"),
             )
             for r in results
         ],
@@ -185,7 +188,6 @@ async def get_document_chunks(
         DocumentChunk.org_unit_id == org_unit_id,
     )
 
-    # Counts by role — computed independent of the role filter below
     text_count = base_query.filter(DocumentChunk.role == "text").count()
     image_count = base_query.filter(DocumentChunk.role == "image").count()
 
@@ -216,6 +218,7 @@ async def get_document_chunks(
                 "contains_table": c.contains_table,
                 "vision_confidence": c.vision_confidence,
                 "is_ground_truth": c.is_ground_truth,
+                "has_tsvector": c.chunk_tsvector is not None,
                 "section_heading": c.section_heading,
                 "topic": c.topic,
                 "chunk_type": c.chunk_type,

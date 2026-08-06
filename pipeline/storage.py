@@ -66,7 +66,7 @@ def check_duplicate(file_hash: str, tenant_id: str, org_unit_id: str) -> Optiona
     spec sheet, a public report) must not see each other's cached summary.
     Returns the existing DB record if found, else None.
     """
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         existing = (
             session.query(DocumentSummary)
             .filter(
@@ -141,7 +141,7 @@ def save_summary(
 
     Returns the saved/updated ORM record.
     """
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
 
         # Check if this exact hash already in DB for this tenant+org_unit
         existing = (

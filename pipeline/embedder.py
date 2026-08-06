@@ -81,7 +81,7 @@ def check_embeddings_exist(doc_hash: str, tenant_id: str, org_unit_id: str) -> b
     so it can't be tripped by another tenant's — or another department's
     — identical content.
     """
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         count = (
             session.query(DocumentChunk)
             .filter(
@@ -103,7 +103,7 @@ def check_image_hash_exists(image_bytes_hash: str, tenant_id: str, org_unit_id: 
     one's upload must NOT be skipped just because the other already has
     that hash — that would leave the second one missing the image chunk.
     """
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         count = (
             session.query(DocumentChunk)
             .filter(
@@ -233,7 +233,7 @@ def store_chunk_embeddings(
         chunk_records.append(record)
 
     # ── Bulk insert + update summary ──────────────────────────────────────────
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         session.bulk_save_objects(chunk_records)
 
         summary = session.query(DocumentSummary).filter(
@@ -392,7 +392,7 @@ def embed_and_store_images(
         image_records.append(record)
 
     # Bulk insert + update image_count on summary
-    with get_db_session_context() as session:
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         session.bulk_save_objects(image_records)
 
         summary = session.query(DocumentSummary).filter(

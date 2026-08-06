@@ -368,6 +368,230 @@
 					}
 				}
 			]
+		},
+		{
+			"name": "Search",
+			"item": [
+				{
+					"name": "Hybrid Search (default)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"annual leave policy\",\n  \"top_k\": 5,\n  \"search_mode\": \"hybrid\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Semantic + keyword combined via Reciprocal Rank Fusion. This is the default \u2014 omitting search_mode entirely does the same thing."
+					},
+					"response": []
+				},
+				{
+					"name": "Semantic Search Only",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"annual leave policy\",\n  \"top_k\": 5,\n  \"search_mode\": \"semantic\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Vector similarity only \u2014 good for meaning-based queries, weak on exact codes/IDs."
+					},
+					"response": []
+				},
+				{
+					"name": "Keyword Search Only",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"GO-2024-0451\",\n  \"top_k\": 5,\n  \"search_mode\": \"keyword\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Exact full-text match via chunk_tsvector \u2014 good for exact reference numbers, codes, acronyms."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Document Chunks",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/chunks/{{doc_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search",
+								"chunks",
+								"{{doc_id}}"
+							]
+						},
+						"description": "Inspect all stored chunks for a document, including has_tsvector to confirm the FTS trigger populated it."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Chat",
+			"item": [
+				{
+					"name": "Send Message",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/chat/message",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"chat",
+								"message"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"What is this document about?\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Starts a new thread if thread_id is omitted. Uses hybrid retrieval automatically."
+					},
+					"response": []
+				}
+			]
 		}
 	]
 }

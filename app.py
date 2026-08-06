@@ -205,7 +205,7 @@ with st.sidebar:
 
     if st.session_state.get("db_ready") and tenant_id.strip() and org_unit_id.strip():
         try:
-            with get_db_session() as session:
+            with get_db_session(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
                 records = (
                     session.query(DocumentSummary)
                     .filter(

@@ -15,7 +15,7 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 import argparse
 import sys
 
-from db.database import init_db, check_db_connection
+from db.database import init_db, check_db_connection, backfill_tsvector
 from pipeline.orchestrator import process_single_document, process_directory
 from utils.logger import get_logger
 
@@ -30,13 +30,18 @@ def main() -> None:
     group.add_argument("--file", type=str, help="Process a single document")
     group.add_argument("--dir",  type=str, help="Process all documents in a folder")
     group.add_argument("--check-db", action="store_true", help="Test DB connection")
+    group.add_argument(
+        "--backfill-tsvector", action="store_true",
+        help="One-time catch-up: populate chunk_tsvector for rows that predate the full-text-search trigger. "
+             "New rows are already covered automatically — only needed after first adding FTS to an existing database.",
+    )
     parser.add_argument(
         "--tenant-id", type=str, default=None,
-        help="Tenant to attribute processed documents to. Required unless --check-db.",
+        help="Tenant to attribute processed documents to. Required unless --check-db or --backfill-tsvector.",
     )
     parser.add_argument(
         "--org-unit-id", type=str, default=None,
-        help="Department/org unit within that tenant. Required unless --check-db.",
+        help="Department/org unit within that tenant. Required unless --check-db or --backfill-tsvector.",
     )
     parser.add_argument(
         "--ground-truth", action="store_true",
@@ -52,6 +57,13 @@ def main() -> None:
         ok = check_db_connection()
         print("DB connection: OK" if ok else "DB connection: FAILED")
         sys.exit(0 if ok else 1)
+
+    # ── Backfill (no tenant/org-unit needed — it fixes every row) ───────────
+    if args.backfill_tsvector:
+        init_db()  # make sure the trigger/column actually exist first
+        total = backfill_tsvector()
+        print(f"✓ Backfilled chunk_tsvector on {total} row(s).")
+        sys.exit(0)
 
     # This is a standalone CLI tool — no gateway headers to read tenant_id
     # or org_unit_id from, so both must be passed explicitly. Refusing to

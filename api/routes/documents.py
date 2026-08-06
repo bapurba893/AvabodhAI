@@ -26,6 +26,7 @@ from typing import Optional
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query, Form
 from fastapi.responses import JSONResponse, FileResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from api.dependencies import get_tenant_id, get_org_unit_id
@@ -410,6 +411,16 @@ async def get_document_file(
     payload = verify_file_token(token)
     if not payload or payload.get("doc_id") != str(doc_id):
         raise HTTPException(status_code=403, detail="Invalid or expired link")
+
+    # This route gets no X-Tenant-ID/X-Org-Unit-ID headers (it's hit as a
+    # plain link, not an authenticated API call), so request.state never
+    # got populated and get_db_session_fastapi() set no RLS context.
+    # With RLS FORCE-enabled on document_summaries, the query below would
+    # silently return zero rows without this — set it explicitly from the
+    # token's own verified payload instead. Same safe parameterized
+    # set_config() pattern as db.database._apply_rls_context().
+    db.execute(text("SELECT set_config('app.tenant_id', :v, true)"), {"v": payload["tenant_id"]})
+    db.execute(text("SELECT set_config('app.org_unit_id', :v, true)"), {"v": payload["org_unit_id"]})
 
     record = (
         db.query(DocumentSummary)

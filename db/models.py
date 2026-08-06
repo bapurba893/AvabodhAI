@@ -18,7 +18,7 @@ from sqlalchemy import (
     Column, DateTime, Integer, String, Text, Float,
     Index, ForeignKey, JSON, Boolean
 )
-from sqlalchemy.dialects.postgresql import UUID, ARRAY
+from sqlalchemy.dialects.postgresql import UUID, ARRAY, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, relationship
 from pgvector.sqlalchemy import Vector
 
@@ -262,6 +262,15 @@ class DocumentChunk(Base):
     # ground-truth documents are ever retrievable by chat/search). ────────
     is_ground_truth    = Column(Boolean,     nullable=False, default=False)
 
+    # ── NEW — full-text search. Nullable and NOT set anywhere in Python —
+    # a Postgres trigger (see db/database.py init_db()) populates this
+    # automatically from chunk_text on every INSERT/UPDATE. This is a
+    # second, independent way to search this table (exact keyword match)
+    # alongside the existing `embedding` column (semantic similarity).
+    # See pipeline/retriever.py for how the two get combined (hybrid
+    # search via Reciprocal Rank Fusion).
+    chunk_tsvector     = Column(TSVECTOR,    nullable=True)
+
     created_at      = Column(DateTime(timezone=True),
                              default=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -278,6 +287,10 @@ class DocumentChunk(Base):
         Index("ix_chunks_tenant_org_gt_role", "tenant_id", "org_unit_id", "is_ground_truth", "role"),
         # NEW — tenant+org-scoped image dedup (check_image_hash_exists)
         Index("ix_chunks_tenant_org_image_hash", "tenant_id", "org_unit_id", "image_bytes_hash"),
+        # NEW — GIN index for full-text search. postgresql_using="gin" is
+        # what makes this a proper FTS index rather than a useless btree
+        # on a tsvector column (btree can't do @@ containment lookups).
+        Index("document_chunks_tsvector_idx", "chunk_tsvector", postgresql_using="gin"),
     )
 
 

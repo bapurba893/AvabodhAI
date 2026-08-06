@@ -34,6 +34,17 @@ services:
       DB_NAME:              ${DB_NAME:-avabodh}
       DB_USER:              ${DB_USER:-postgres}
       DB_PASSWORD:          ${DB_PASSWORD}
+      # Restricted app role — created automatically by init_db() on first
+      # boot, using DB_USER/DB_PASSWORD above just for that one bootstrap
+      # step. This is what the app actually queries with afterward, and
+      # what Row-Level Security genuinely restricts (RLS cannot restrict
+      # DB_USER if it's a Postgres superuser, which it is by default in
+      # this setup — see db/database.py for the full explanation).
+      # CHANGE APP_DB_PASSWORD before any real deployment.
+      APP_DB_USER:          ${APP_DB_USER:-avabodh_app}
+      APP_DB_PASSWORD:      ${APP_DB_PASSWORD:-CHANGE-ME-app-role-password}
+      FTS_LANGUAGE:         ${FTS_LANGUAGE:-english}
+      HYBRID_RRF_K:         ${HYBRID_RRF_K:-60}
       DOCUMENTS_DIR:        ./documents
       MIN_CHUNK_SIZE:       ${MIN_CHUNK_SIZE:-100}
       MAX_CHUNK_SIZE:       ${MAX_CHUNK_SIZE:-3000}

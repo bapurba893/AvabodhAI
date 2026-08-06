@@ -53,6 +53,32 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: int = 30
 
+    # ── Restricted application role — used for ALL normal request-serving
+    # queries. DB_USER/DB_PASSWORD above (typically the Postgres superuser
+    # in this docker-compose setup) are used ONLY once, at startup, to
+    # bootstrap the schema (create tables, the FTS trigger, this role
+    # itself, and the Row-Level Security policies below).
+    #
+    # This separation exists because Postgres RLS CANNOT restrict a
+    # superuser's queries, ever, by design — no policy setting or FORCE
+    # clause changes that. If the application connected using the same
+    # superuser credentials for everything, the RLS policies below would
+    # provide zero real protection for the app's own traffic. This role
+    # is deliberately NOT a superuser and does NOT have BYPASSRLS, so RLS
+    # actually applies to it.
+    #
+    # Anyone (including teammates in pgAdmin) who wants tenant/org-unit
+    # isolation to actually bound their ad-hoc queries must connect using
+    # THESE credentials, not DB_USER/DB_PASSWORD. Connecting as the
+    # superuser bypasses every isolation guarantee in this document —
+    # see the reference document for the full explanation.
+    APP_DB_USER: str = "avabodh_app"
+    APP_DB_PASSWORD: str = "CHANGE-ME-app-role-password"
+
+    # ── Full-text search / hybrid search ────────────────────────────────────
+    FTS_LANGUAGE: str = "english"          # Postgres text search config used by the trigger and keyword queries
+    HYBRID_RRF_K: int = 60                 # Reciprocal Rank Fusion constant — standard default (same as Elasticsearch's)
+
     # ── Document loader ────────────────────────────────────────────────────
     DOCUMENTS_DIR: str = "./documents"
     SUPPORTED_EXTENSIONS: list[str] = [".pdf", ".txt", ".docx", ".csv"]
@@ -93,8 +119,17 @@ class Settings(BaseSettings):
 
     @property
     def db_url(self) -> str:
+        """Admin/superuser connection — used ONLY for schema bootstrap in init_db(). Not for regular queries."""
         return (
             f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        )
+
+    @property
+    def app_db_url(self) -> str:
+        """Restricted app-role connection — used for all normal request-serving queries. RLS actually applies to this one."""
+        return (
+            f"postgresql+psycopg2://{self.APP_DB_USER}:{self.APP_DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
         )
 
