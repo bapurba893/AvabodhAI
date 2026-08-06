@@ -41,6 +41,7 @@ def vector_search(
     query_vector: list[float],
     db: Session,
     tenant_id: str,
+    org_unit_id: str,
     top_k: int = 10,
     doc_filter: Optional[str] = None,
     role_filter: Optional[str] = None,
@@ -49,10 +50,15 @@ def vector_search(
     Search document_chunks table using pgvector cosine similarity.
     Returns top_k most similar chunks with similarity scores.
 
-    tenant_id is REQUIRED (not optional, no default) and is always applied
-    to the WHERE clause — this is the one place in the app where a
-    cross-tenant document leak would happen if it were forgotten, so the
-    function signature makes it impossible to call without one.
+    tenant_id and org_unit_id are BOTH required (no defaults) and always
+    applied together to the WHERE clause — org_unit_id is a hard boundary
+    WITHIN a tenant (department-level), so a department code that happens
+    to collide across two different tenants must never leak across
+    companies. Never filter on org_unit_id alone.
+
+    is_ground_truth = true is always applied too, unconditionally — there
+    is no query-time toggle for this by design (confirmed: only documents
+    explicitly marked ground truth are ever retrievable).
 
     role_filter: 'text' | 'image' | None (None = search both — this is how
     a text-only query still surfaces relevant image captions automatically,
@@ -63,8 +69,15 @@ def vector_search(
     chat.py source attribution) can tell text chunks and image chunks apart
     and render them differently.
     """
-    where_clauses = ["tenant_id = :tenant_id"]
-    params: dict = {"vector": str(query_vector), "top_k": top_k, "tenant_id": tenant_id}
+    where_clauses = [
+        "tenant_id = :tenant_id",
+        "org_unit_id = :org_unit_id",
+        "is_ground_truth = true",
+    ]
+    params: dict = {
+        "vector": str(query_vector), "top_k": top_k,
+        "tenant_id": tenant_id, "org_unit_id": org_unit_id,
+    }
 
     if doc_filter:
         where_clauses.append("doc_name = :doc_filter")
@@ -206,6 +219,7 @@ def retrieve(
     query: str,
     db: Session,
     tenant_id: str,
+    org_unit_id: str,
     top_k: int = 5,
     doc_filter: Optional[str] = None,
     role_filter: Optional[str] = None,
@@ -214,7 +228,7 @@ def retrieve(
     Full retrieval pipeline:
     1. Embed query
     2. Vector search (both text and image chunks, unless role_filter narrows it) —
-       always scoped to tenant_id
+       always scoped to tenant_id + org_unit_id, always ground-truth-only
     3. Contextual compression
     Returns final list of relevant chunks.
     """
@@ -226,6 +240,7 @@ def retrieve(
         query_vector=query_vector,
         db=db,
         tenant_id=tenant_id,
+        org_unit_id=org_unit_id,
         top_k=top_k * 2,    # get 2x so compression has room to filter
         doc_filter=doc_filter,
         role_filter=role_filter,

@@ -128,6 +128,12 @@ class DocumentSummary(Base):
     # ── Multi-tenancy — REQUIRED on every row, set from the X-Tenant-ID
     # header at write time. Every read in this app must filter on this. ──
     tenant_id           = Column(String(128), nullable=False, index=True)
+    # ── Department-level isolation WITHIN a tenant — REQUIRED, set from
+    # X-Org-Unit-ID header, same trust model as tenant_id. ALWAYS filtered
+    # together with tenant_id, never alone (see composite indexes below —
+    # a standalone org_unit_id match would leak across tenants if two
+    # different companies happen to use the same department code). ──────
+    org_unit_id          = Column(String(128), nullable=False, index=True)
     doc_name            = Column(String(512), nullable=False, index=True)
     summary_text        = Column(Text, nullable=False)
     key_topics          = Column(Text, nullable=True)
@@ -160,6 +166,12 @@ class DocumentSummary(Base):
     # ── Image tracking ────────────────────────────────────────────────────────
     image_count             = Column(Integer, default=0)   # how many images extracted and embedded
 
+    # ── NEW — client-supplied document fields (Upload Knowledge Document form) ──
+    category       = Column(String(128), nullable=True, index=True)   # client-defined, free text: "Policy", "Guide"
+    effective_from = Column(DateTime(timezone=True), nullable=True)   # validity window start — metadata only,
+    effective_to   = Column(DateTime(timezone=True), nullable=True)   # no retrieval effect (by design — confirmed)
+    is_ground_truth = Column(Boolean, nullable=False, default=False)  # gates retrieval — see DocumentChunk.is_ground_truth
+
     created_at          = Column(DateTime(timezone=True),
                                  default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at          = Column(DateTime(timezone=True),
@@ -172,10 +184,15 @@ class DocumentSummary(Base):
     __table_args__ = (
         Index("ix_doc_summaries_source_path", "source_path"),
         Index("ix_doc_summaries_doc_type_domain", "document_type", "domain"),
-        # NEW — tenant-scoped dedup lookups (check_duplicate / same_name upsert
+        # Tenant-scoped dedup lookups (check_duplicate / same_name upsert
         # in pipeline/storage.py) hit these directly.
         Index("ix_doc_summaries_tenant_hash", "tenant_id", "doc_hash"),
         Index("ix_doc_summaries_tenant_name", "tenant_id", "doc_name"),
+        # NEW — org_unit_id is a hard boundary WITHIN a tenant, so every
+        # lookup that used to be (tenant_id, X) becomes (tenant_id,
+        # org_unit_id, X) — never org_unit_id alone (see column comment).
+        Index("ix_doc_summaries_tenant_org_hash", "tenant_id", "org_unit_id", "doc_hash"),
+        Index("ix_doc_summaries_tenant_org_name", "tenant_id", "org_unit_id", "doc_name"),
     )
 
 
@@ -192,6 +209,9 @@ class DocumentChunk(Base):
     # summary_id) keeps the pgvector similarity query fast and simple:
     # WHERE tenant_id = :tenant_id ORDER BY embedding <=> :vector ──────────
     tenant_id       = Column(String(128), nullable=False, index=True)
+    # ── Department-level isolation, denormalized same as tenant_id — see
+    # DocumentSummary.org_unit_id comment. ALWAYS paired with tenant_id. ──
+    org_unit_id     = Column(String(128), nullable=False, index=True)
     summary_id      = Column(UUID(as_uuid=True),
                              ForeignKey("document_summaries.id", ondelete="CASCADE"),
                              nullable=False, index=True)
@@ -235,6 +255,13 @@ class DocumentChunk(Base):
     vision_model_used  = Column(String(64),  nullable=True)   # gpt-4o
     vision_confidence  = Column(Float,       nullable=True)   # 0.0-1.0
 
+    # ── NEW — gates retrieval. Denormalized from DocumentSummary at insert
+    # time so vector_search() can filter WHERE is_ground_truth = true
+    # directly, same pattern as tenant_id/role. No user-facing toggle at
+    # query time — this is always enforced, not optional (confirmed: only
+    # ground-truth documents are ever retrievable by chat/search). ────────
+    is_ground_truth    = Column(Boolean,     nullable=False, default=False)
+
     created_at      = Column(DateTime(timezone=True),
                              default=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -245,12 +272,12 @@ class DocumentChunk(Base):
         Index("ix_chunks_topic", "topic"),
         Index("ix_chunks_role", "role"),
         Index("ix_chunks_image_bytes_hash", "image_bytes_hash"),
-        # NEW — every retrieval query filters WHERE tenant_id = ... first;
-        # pairing it with role covers the most common query shape directly
-        # (role_filter + tenant_id together, as used by vector_search()).
-        Index("ix_chunks_tenant_role", "tenant_id", "role"),
-        # NEW — tenant-scoped image dedup (check_image_hash_exists)
-        Index("ix_chunks_tenant_image_hash", "tenant_id", "image_bytes_hash"),
+        # Every retrieval query filters WHERE tenant_id = ... AND
+        # org_unit_id = ... AND is_ground_truth = true, all together —
+        # this composite index covers that exact query shape directly.
+        Index("ix_chunks_tenant_org_gt_role", "tenant_id", "org_unit_id", "is_ground_truth", "role"),
+        # NEW — tenant+org-scoped image dedup (check_image_hash_exists)
+        Index("ix_chunks_tenant_org_image_hash", "tenant_id", "org_unit_id", "image_bytes_hash"),
     )
 
 
@@ -265,6 +292,8 @@ class ChatThread(Base):
     # ── Multi-tenancy — same rule as documents: every thread belongs to
     # exactly one tenant, set from X-Tenant-ID when the thread is created. ──
     tenant_id  = Column(String(128), nullable=False, index=True)
+    # ── Department-level isolation, same rule as documents. ─────────────
+    org_unit_id = Column(String(128), nullable=False, index=True)
     title      = Column(String(512), nullable=True)
     user_id    = Column(String(256), nullable=True)
     doc_filter = Column(String(512), nullable=True)
@@ -281,8 +310,9 @@ class ChatThread(Base):
 
     __table_args__ = (
         Index("ix_chat_threads_user_id", "user_id"),
-        # NEW — thread list/get/patch/delete all filter WHERE tenant_id = ...
-        Index("ix_chat_threads_tenant_user", "tenant_id", "user_id"),
+        # Thread list/get/patch/delete all filter WHERE tenant_id = ...
+        # AND org_unit_id = ... together.
+        Index("ix_chat_threads_tenant_org_user", "tenant_id", "org_unit_id", "user_id"),
     )
 
     def __repr__(self) -> str:
@@ -301,6 +331,8 @@ class ChatMessage(Base):
     # most for the /chat/search semantic-search-over-history endpoint,
     # which queries chat_messages directly and must not cross tenants. ────
     tenant_id = Column(String(128), nullable=False, index=True)
+    # ── Department-level isolation, denormalized same as tenant_id. ─────
+    org_unit_id = Column(String(128), nullable=False, index=True)
     thread_id = Column(UUID(as_uuid=True),
                        ForeignKey("chat_threads.id", ondelete="CASCADE"),
                        nullable=False, index=True)
@@ -327,8 +359,8 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("ix_chat_messages_thread_role", "thread_id", "role"),
-        # NEW — GET /chat/search filters WHERE tenant_id = ... directly
-        Index("ix_chat_messages_tenant", "tenant_id"),
+        # GET /chat/search filters WHERE tenant_id = ... AND org_unit_id = ...
+        Index("ix_chat_messages_tenant_org", "tenant_id", "org_unit_id"),
     )
 
     def __repr__(self) -> str:

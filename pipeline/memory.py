@@ -25,7 +25,7 @@ settings = get_settings()
 MEMORY_WINDOW_SIZE = 5
 
 
-def load_memory_from_db(thread_id: str, tenant_id: str, db: Session) -> ConversationBufferWindowMemory:
+def load_memory_from_db(thread_id: str, tenant_id: str, org_unit_id: str, db: Session) -> ConversationBufferWindowMemory:
     """
     Load last N turns from chat_messages table.
     Returns a ConversationBufferWindowMemory with history injected.
@@ -33,12 +33,13 @@ def load_memory_from_db(thread_id: str, tenant_id: str, db: Session) -> Conversa
     This is called on every request — memory is rebuilt from DB each time.
     This ensures consistency even if server restarts.
 
-    tenant_id: filtered here even though thread_id alone is already
-    effectively tenant-unique (every ChatMessage.thread_id points at
-    exactly one ChatThread, which belongs to exactly one tenant, and the
-    caller already validated thread ownership via get_thread() before
-    reaching this call). Filtering by both anyway means this query stays
-    correct even if that upstream check is ever refactored away.
+    tenant_id + org_unit_id: filtered here even though thread_id alone is
+    already effectively unique to one tenant+org_unit (every
+    ChatMessage.thread_id points at exactly one ChatThread, which belongs
+    to exactly one tenant and department, and the caller already
+    validated thread ownership via get_thread() before reaching this
+    call). Filtering by both anyway means this query stays correct even
+    if that upstream check is ever refactored away.
     """
     memory = ConversationBufferWindowMemory(
         k=MEMORY_WINDOW_SIZE,
@@ -52,7 +53,11 @@ def load_memory_from_db(thread_id: str, tenant_id: str, db: Session) -> Conversa
         # Load last N*2 messages (N turns = N human + N AI)
         messages = (
             db.query(ChatMessage)
-            .filter(ChatMessage.thread_id == thread_id, ChatMessage.tenant_id == tenant_id)
+            .filter(
+                ChatMessage.thread_id == thread_id,
+                ChatMessage.tenant_id == tenant_id,
+                ChatMessage.org_unit_id == org_unit_id,
+            )
             .order_by(ChatMessage.created_at.asc())
             .limit(MEMORY_WINDOW_SIZE * 2)
             .all()

@@ -4,8 +4,16 @@ pipeline/embedder.py
 Generate and store chunk embeddings in pgvector.
 
 Two entry points:
-  store_chunk_embeddings()   — text chunks (existing, unchanged logic)
-  embed_and_store_images()   — image chunks (NEW — called after image_processor)
+  store_chunk_embeddings()   — text chunks
+  embed_and_store_images()   — image chunks (called after image_processor)
+
+Both are scoped by (tenant_id, org_unit_id) together — org_unit_id is a
+hard boundary WITHIN a tenant (department-level isolation), so every dedup
+check and every stamped record uses both, never tenant_id alone.
+
+is_ground_truth is stamped onto every chunk (text and image) from the
+parent document's value, denormalized the same way tenant_id/org_unit_id
+are — retrieval filters on it directly with no join.
 """
 
 import gc
@@ -64,13 +72,14 @@ def _embed_batch(texts: list[str], client: OpenAIEmbeddings) -> list[list[float]
     return client.embed_documents(texts)
 
 
-def check_embeddings_exist(doc_hash: str, tenant_id: str) -> bool:
+def check_embeddings_exist(doc_hash: str, tenant_id: str, org_unit_id: str) -> bool:
     """
     True if TEXT chunks already exist for this doc_hash, within this
-    tenant. Filtered to role='text' so a document that (somehow) only
-    has image chunks stored doesn't cause text re-embedding to be
-    skipped, and to tenant_id so it can't be tripped by another
-    tenant's identical content.
+    tenant AND org unit. Filtered to role='text' so a document that
+    (somehow) only has image chunks stored doesn't cause text
+    re-embedding to be skipped, and to (tenant_id, org_unit_id) together
+    so it can't be tripped by another tenant's — or another department's
+    — identical content.
     """
     with get_db_session_context() as session:
         count = (
@@ -79,19 +88,20 @@ def check_embeddings_exist(doc_hash: str, tenant_id: str) -> bool:
                 DocumentChunk.doc_hash == doc_hash,
                 DocumentChunk.role == "text",
                 DocumentChunk.tenant_id == tenant_id,
+                DocumentChunk.org_unit_id == org_unit_id,
             )
             .count()
         )
         return count > 0
 
 
-def check_image_hash_exists(image_bytes_hash: str, tenant_id: str) -> bool:
+def check_image_hash_exists(image_bytes_hash: str, tenant_id: str, org_unit_id: str) -> bool:
     """
-    Check if this exact image is already embedded for this tenant — dedup.
-    Scoped by tenant_id: if Tenant A and Tenant B both have a document
-    containing the same stock image or shared logo, Tenant B's upload
-    must NOT be skipped just because Tenant A already has that hash —
-    that would leave Tenant B's own document missing the image chunk.
+    Check if this exact image is already embedded for this tenant+org
+    unit — dedup. Scoped by both: if two departments (or two tenants)
+    both have a document containing the same stock image or shared logo,
+    one's upload must NOT be skipped just because the other already has
+    that hash — that would leave the second one missing the image chunk.
     """
     with get_db_session_context() as session:
         count = (
@@ -100,6 +110,7 @@ def check_image_hash_exists(image_bytes_hash: str, tenant_id: str) -> bool:
                 DocumentChunk.image_bytes_hash == image_bytes_hash,
                 DocumentChunk.role == "image",
                 DocumentChunk.tenant_id == tenant_id,
+                DocumentChunk.org_unit_id == org_unit_id,
             )
             .count()
         )
@@ -107,7 +118,7 @@ def check_image_hash_exists(image_bytes_hash: str, tenant_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Text chunk embeddings (UNCHANGED logic from original)
+# Text chunk embeddings
 # ─────────────────────────────────────────────────────────────────────────────
 
 def store_chunk_embeddings(
@@ -116,20 +127,25 @@ def store_chunk_embeddings(
     doc_hash: str,
     doc_name: str,
     tenant_id: str,
+    org_unit_id: str,
+    is_ground_truth: bool = False,
     source_path: str = "",
     chunk_metadata: Optional[list[Optional[ChunkMetadataOutput]]] = None,
 ) -> dict:
     """
     Generate and store text chunk embeddings.
-    tenant_id is stamped onto every DocumentChunk row (denormalized from
-    the parent document) so vector_search() can filter directly without
-    a JOIN. Image chunks go through embed_and_store_images().
+    tenant_id + org_unit_id are stamped onto every DocumentChunk row
+    (denormalized from the parent document) so vector_search() can
+    filter directly without a JOIN. is_ground_truth is stamped the same
+    way — always enforced at retrieval, no per-query toggle.
+    Image chunks go through embed_and_store_images().
     """
     if not chunks:
         raise ValueError(f"No chunks provided for '{doc_name}'")
 
-    if check_embeddings_exist(doc_hash, tenant_id):
-        logger.info("Embeddings already exist for tenant=%s '%s' — skipping", tenant_id, doc_name)
+    if check_embeddings_exist(doc_hash, tenant_id, org_unit_id):
+        logger.info("Embeddings already exist for tenant=%s org_unit=%s '%s' — skipping",
+                    tenant_id, org_unit_id, doc_name)
         return {"status": "skipped", "doc_name": doc_name, "chunk_count": 0, "elapsed_sec": 0.0}
 
     logger.info(
@@ -192,6 +208,8 @@ def store_chunk_embeddings(
     for validated, embedding_vector, meta in zip(validated_chunks, all_embeddings, validated_meta):
         record = DocumentChunk(
             tenant_id           = tenant_id,
+            org_unit_id         = org_unit_id,
+            is_ground_truth     = is_ground_truth,
             summary_id          = summary_id,
             doc_hash            = validated.doc_hash,
             doc_name            = validated.doc_name,
@@ -221,6 +239,7 @@ def store_chunk_embeddings(
         summary = session.query(DocumentSummary).filter(
             DocumentSummary.id == summary_id,
             DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
         ).first()
         if summary:
             summary.embedding_status    = "completed"
@@ -245,7 +264,7 @@ def store_chunk_embeddings(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image embeddings (NEW)
+# Image embeddings
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImageEmbeddingInput(BaseModel):
@@ -281,12 +300,16 @@ def embed_and_store_images(
     summary_id: UUID,
     doc_name:   str,
     tenant_id:  str,
+    org_unit_id: str,
+    is_ground_truth: bool = False,
 ) -> dict:
     """
     Embed image caption composite texts and store as DocumentChunk rows
-    with role='image'. tenant_id is stamped onto every record and used
-    to scope the dedup check — see check_image_hash_exists() docstring
-    for why this must be per-tenant, not global.
+    with role='image'. tenant_id + org_unit_id are stamped onto every
+    record and used to scope the dedup check — see
+    check_image_hash_exists() docstring for why this must be per
+    tenant+org-unit, not global. is_ground_truth stamped the same way,
+    always enforced at retrieval.
 
     Called after image_processor.py has already:
     - filtered noise
@@ -302,12 +325,12 @@ def embed_and_store_images(
     start = time.time()
     client = _get_embeddings_client()
 
-    # Filter out already-embedded images (dedup by image_bytes_hash, per tenant)
+    # Filter out already-embedded images (dedup by image_bytes_hash, per tenant+org_unit)
     new_images = []
     for img in images:
-        if check_image_hash_exists(img.image_bytes_hash, tenant_id):
-            logger.info("Image already embedded for tenant=%s (hash=%s) — skipping",
-                        tenant_id, img.image_bytes_hash[:12])
+        if check_image_hash_exists(img.image_bytes_hash, tenant_id, org_unit_id):
+            logger.info("Image already embedded for tenant=%s org_unit=%s (hash=%s) — skipping",
+                        tenant_id, org_unit_id, img.image_bytes_hash[:12])
         else:
             new_images.append(img)
 
@@ -333,6 +356,8 @@ def embed_and_store_images(
     for img, embedding_vector in zip(new_images, all_embeddings):
         record = DocumentChunk(
             tenant_id          = tenant_id,
+            org_unit_id        = org_unit_id,
+            is_ground_truth    = is_ground_truth,
             summary_id         = img.summary_id,
             doc_hash           = img.doc_hash,
             doc_name           = img.doc_name,
@@ -373,6 +398,7 @@ def embed_and_store_images(
         summary = session.query(DocumentSummary).filter(
             DocumentSummary.id == summary_id,
             DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
         ).first()
         if summary:
             summary.image_count = (summary.image_count or 0) + len(image_records)

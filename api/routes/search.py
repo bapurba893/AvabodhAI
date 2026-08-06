@@ -8,10 +8,12 @@ chunks only, or both (default). Image chunks surface their caption/type
 alongside the usual chunk fields so callers can render them differently
 from text results.
 
-Multi-tenancy: both endpoints take tenant_id from the X-Tenant-ID header
-and apply it as a mandatory filter — this is a search endpoint, so it's
-exactly the kind of query that would leak another tenant's document
-content if the filter were ever dropped.
+Multi-tenancy + department isolation: both endpoints take tenant_id AND
+org_unit_id from the X-Tenant-ID / X-Org-Unit-ID headers and apply both
+as mandatory filters, together — this is a search endpoint, exactly the
+kind of query that would leak another tenant's, or another department's,
+document content if either filter were ever dropped. is_ground_truth is
+always applied too, unconditionally, same as every other retrieval path.
 """
 
 import uuid
@@ -22,7 +24,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel, Field, field_validator
 
-from api.dependencies import get_tenant_id
+from api.dependencies import get_tenant_id, get_org_unit_id
 from db.database import get_db_session_fastapi
 from db.models import DocumentChunk
 from pipeline.retriever import embed_query
@@ -40,7 +42,7 @@ class SearchRequest(BaseModel):
     query:    str = Field(min_length=1, description="Search query")
     top_k:    int = Field(default=5, ge=1, le=20, description="Number of results")
     doc_name: Optional[str] = Field(default=None, description="Filter by document name (optional)")
-    # NEW — scope search to text chunks, image chunks, or both (default None = both)
+    # Scope search to text chunks, image chunks, or both (default None = both)
     role:     Optional[str] = Field(
         default=None,
         description="Filter by chunk role: 'text' or 'image'. Omit to search both.",
@@ -65,7 +67,6 @@ class ChunkResult(BaseModel):
     chunk_size:  int
     page_number: Optional[int] = None
     similarity:  float
-    # NEW — role-aware fields
     role:            str = "text"
     image_type:      Optional[str] = None
     image_caption:   Optional[str] = None
@@ -84,21 +85,29 @@ class SearchResponse(BaseModel):
 async def semantic_search(
     payload: SearchRequest,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     """
     Find most relevant chunks for a query using vector similarity.
     By default searches BOTH text and image chunks — pass role='text' or
     role='image' to scope the search to just one kind. Always scoped to
-    the caller's tenant_id.
+    the caller's tenant_id + org_unit_id, and always ground-truth-only.
     """
     try:
         query_vector = embed_query(payload.query)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding query failed: {e}")
 
-    where_clauses = ["tenant_id = :tenant_id"]
-    params: dict = {"vector": str(query_vector), "top_k": payload.top_k, "tenant_id": tenant_id}
+    where_clauses = [
+        "tenant_id = :tenant_id",
+        "org_unit_id = :org_unit_id",
+        "is_ground_truth = true",
+    ]
+    params: dict = {
+        "vector": str(query_vector), "top_k": payload.top_k,
+        "tenant_id": tenant_id, "org_unit_id": org_unit_id,
+    }
 
     if payload.doc_name:
         where_clauses.append("doc_name = :doc_name")
@@ -153,13 +162,17 @@ async def get_document_chunks(
     doc_id: uuid.UUID,
     role: Optional[str] = None,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     """
-    Get all stored chunks and metadata for a document, scoped to tenant_id.
-    Pass role='text' or role='image' to filter to just one kind — the
-    response always reports both text_chunks and image_chunks counts
-    regardless of the filter, so callers can see the full breakdown.
+    Get all stored chunks and metadata for a document, scoped to
+    tenant_id + org_unit_id. Pass role='text' or role='image' to filter
+    to just one kind — the response always reports both text_chunks and
+    image_chunks counts regardless of the filter, so callers can see the
+    full breakdown. NOT filtered by is_ground_truth — this is a document-
+    management view of a document you already own, not a retrieval path,
+    so it deliberately shows all chunks including non-ground-truth ones.
     """
     if role is not None:
         role = role.strip().lower()
@@ -169,6 +182,7 @@ async def get_document_chunks(
     base_query = db.query(DocumentChunk).filter(
         DocumentChunk.summary_id == doc_id,
         DocumentChunk.tenant_id == tenant_id,
+        DocumentChunk.org_unit_id == org_unit_id,
     )
 
     # Counts by role — computed independent of the role filter below
@@ -201,6 +215,7 @@ async def get_document_chunks(
                 "contains_chart": c.contains_chart,
                 "contains_table": c.contains_table,
                 "vision_confidence": c.vision_confidence,
+                "is_ground_truth": c.is_ground_truth,
                 "section_heading": c.section_heading,
                 "topic": c.topic,
                 "chunk_type": c.chunk_type,

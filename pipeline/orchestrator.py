@@ -9,7 +9,7 @@ Step 2 — Split into chunks
 Step 3+4 — Map-Reduce summarisation (OpenAI)
 Step 5 — Pydantic validation
 Step 6 — Save summary to PostgreSQL
-Step 7 — Generate and store chunk embeddings in pgvector (NEW)
+Step 7 — Generate and store chunk embeddings in pgvector
 """
 
 import os
@@ -58,19 +58,30 @@ class BatchReport:
         )
 
 
-def process_single_document(filepath: str, tenant_id: str) -> ProcessingResult:
+def process_single_document(
+    filepath: str,
+    tenant_id: str,
+    org_unit_id: str,
+    is_ground_truth: bool = False,
+) -> ProcessingResult:
     """
     Full 7-step pipeline for one document.
     Step 7 (embeddings) runs after summary is saved.
 
-    tenant_id: this is a standalone CLI/batch tool (not behind the API
-    gateway), so there's no header to read it from — the caller (e.g.
-    process_directory, or a script) must supply it explicitly. Documents
-    bulk-loaded this way are attributed to that tenant exactly like an
-    upload through the API would be.
+    tenant_id + org_unit_id: this is a standalone CLI/batch tool (not
+    behind the API gateway), so there's no headers to read them from —
+    the caller (e.g. process_directory, or a script) must supply both
+    explicitly. Documents bulk-loaded this way are attributed exactly
+    like an upload through the API would be.
+
+    is_ground_truth defaults to False, matching the API upload default —
+    bulk-loaded documents don't become retrievable until explicitly
+    marked ground truth (via a future admin action, or by passing
+    is_ground_truth=True here directly if the operator already knows
+    that's appropriate for this batch).
     """
     doc_name = os.path.basename(filepath)
-    logger.info("--- Processing: %s (tenant=%s) ---", doc_name, tenant_id)
+    logger.info("--- Processing: %s (tenant=%s org_unit=%s) ---", doc_name, tenant_id, org_unit_id)
 
     docs = None
     chunks = None
@@ -86,9 +97,9 @@ def process_single_document(filepath: str, tenant_id: str) -> ProcessingResult:
         source_path = docs[0].metadata.get("source_path", filepath)
         page_count  = len(docs)
 
-        # ── Dedup check — scoped to this tenant ──────────────────────────────
+        # ── Dedup check — scoped to this tenant + org unit ──────────────────
         if file_hash:
-            existing = check_duplicate(file_hash, tenant_id)
+            existing = check_duplicate(file_hash, tenant_id, org_unit_id)
             if existing:
                 return ProcessingResult(
                     filepath=filepath, doc_name=doc_name,
@@ -125,7 +136,11 @@ def process_single_document(filepath: str, tenant_id: str) -> ProcessingResult:
             "page_count":  page_count,
         }
         validated = validate_summary(raw_result, metadata)
-        record    = save_summary(validated, file_hash, chunk_count, tenant_id=tenant_id)
+        record    = save_summary(
+            validated, file_hash, chunk_count,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            is_ground_truth=is_ground_truth,
+        )
 
         logger.info("Summary saved for '%s' | ID: %s", doc_name, record.id)
 
@@ -136,6 +151,8 @@ def process_single_document(filepath: str, tenant_id: str) -> ProcessingResult:
             doc_hash    = file_hash,
             doc_name    = doc_name,
             tenant_id   = tenant_id,
+            org_unit_id = org_unit_id,
+            is_ground_truth = is_ground_truth,
             source_path = source_path,
         )
 
@@ -173,23 +190,28 @@ def process_single_document(filepath: str, tenant_id: str) -> ProcessingResult:
         )
 
 
-def process_directory(tenant_id: str, directory: str = None) -> BatchReport:
+def process_directory(
+    tenant_id: str,
+    org_unit_id: str,
+    directory: str = None,
+    is_ground_truth: bool = False,
+) -> BatchReport:
     """
-    Process all documents in a directory, attributed to tenant_id.
-    tenant_id is required and required first — this is a batch-loading
-    tool, so there's no gateway header to infer it from; the operator
-    running this script must say explicitly which tenant these documents
-    belong to.
+    Process all documents in a directory, attributed to tenant_id +
+    org_unit_id. Both are required and required first — this is a
+    batch-loading tool, so there's no gateway headers to infer them
+    from; the operator running this script must say explicitly which
+    tenant AND which department these documents belong to.
     """
     directory = directory or settings.DOCUMENTS_DIR
     report = BatchReport()
     init_db()
 
-    logger.info("Starting batch for directory: %s (tenant=%s)", directory, tenant_id)
+    logger.info("Starting batch for directory: %s (tenant=%s org_unit=%s)", directory, tenant_id, org_unit_id)
 
     for filepath, _ in load_directory(directory):
         report.total += 1
-        result = process_single_document(filepath, tenant_id)
+        result = process_single_document(filepath, tenant_id, org_unit_id, is_ground_truth)
         report.results.append(result)
 
         if result.skipped:

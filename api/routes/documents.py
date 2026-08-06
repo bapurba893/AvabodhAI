@@ -3,22 +3,32 @@ api/routes/documents.py
 -----------------------
 All document-related API endpoints.
 
-Multi-tenancy: every endpoint takes tenant_id from the X-Tenant-ID header
-(via api.dependencies.get_tenant_id) and threads it through every pipeline
-call and every DB query. Nothing in this file reads or writes
-document_summaries / document_chunks without a tenant_id filter attached.
+Multi-tenancy + department isolation: every endpoint takes tenant_id AND
+org_unit_id from the X-Tenant-ID / X-Org-Unit-ID headers (via
+api.dependencies) and threads both through every pipeline call and every
+DB query, together, never either one alone. Nothing in this file reads
+or writes document_summaries / document_chunks without both filters
+attached.
+
+Preview: no separate preview endpoint — GET /documents/{id} already
+returns everything a preview needs (summary, title, category,
+org_unit_id, tenant_id, effective dates, ground-truth flag) plus a
+`preview_link` field. That link points at a signed, short-lived URL
+(GET /documents/{id}/file) since a plain clickable link/iframe can't
+carry our auth headers — see utils/signed_link.py.
 """
 
 import os
 import shutil
 import uuid
+from datetime import date, datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query, Form
+from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.orm import Session
 
-from api.dependencies import get_tenant_id
+from api.dependencies import get_tenant_id, get_org_unit_id
 from api.schemas.document import (
     DocumentUploadResponse,
     DocumentListResponse,
@@ -35,6 +45,7 @@ from pipeline.splitter import split_documents
 from pipeline.summariser import summarise_document
 from pipeline.storage import validate_summary, check_duplicate, save_summary
 from pipeline.embedder import store_chunk_embeddings, embed_and_store_images, ImageEmbeddingInput
+from utils.signed_link import generate_file_token, verify_file_token
 from config.settings import get_settings
 from utils.logger import get_logger
 
@@ -57,6 +68,29 @@ def _validate_file_extension(filename: str) -> str:
     return ext
 
 
+def _to_utc_datetime(d: Optional[date]) -> Optional[datetime]:
+    """Convert an HTML <input type=date> value to a tz-aware datetime for storage."""
+    if d is None:
+        return None
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+
+def _build_preview_link(record: DocumentSummary, tenant_id: str, org_unit_id: str) -> Optional[str]:
+    """
+    Web-scraped documents: source_path IS the original URL — just return it.
+    Uploaded documents: build a signed, short-lived link to our own
+    file-serving endpoint, since a plain link can't carry auth headers.
+    """
+    if not record.source_path:
+        return None
+    if record.source_path.startswith("http://") or record.source_path.startswith("https://"):
+        return record.source_path
+    if not os.path.exists(record.source_path):
+        return None
+    token = generate_file_token(str(record.id), tenant_id, org_unit_id)
+    return f"/documents/{record.id}/file?token={token}"
+
+
 @router.post(
     "/upload",
     response_model=DocumentUploadResponse,
@@ -65,7 +99,12 @@ def _validate_file_extension(filename: str) -> str:
 )
 async def upload_document(
     file: UploadFile = File(..., description="PDF, TXT, DOCX, or CSV file"),
+    category: Optional[str] = Form(default=None, description="Client-defined category, e.g. 'Policy', 'Guide'"),
+    effective_from: Optional[date] = Form(default=None, description="Validity window start — metadata only, no retrieval effect"),
+    effective_to: Optional[date] = Form(default=None, description="Validity window end — metadata only, no retrieval effect"),
+    is_ground_truth: bool = Form(default=False, description="Only ground-truth documents are ever retrievable by chat/search"),
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     ext = _validate_file_extension(file.filename)
@@ -74,7 +113,7 @@ async def upload_document(
     try:
         with open(temp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        logger.info("File saved: %s (tenant=%s)", file.filename, tenant_id)
+        logger.info("File saved: %s (tenant=%s org_unit=%s)", file.filename, tenant_id, org_unit_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
@@ -87,18 +126,20 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Load failed: {e}")
 
-    # ── Dedup check — scoped to THIS tenant only ────────────────────────────
+    # ── Dedup check — scoped to THIS tenant + org unit only ─────────────────
     if file_hash:
-        existing = check_duplicate(file_hash, tenant_id)
+        existing = check_duplicate(file_hash, tenant_id, org_unit_id)
         if existing:
-            logger.info("Duplicate detected for '%s' (tenant=%s)", file.filename, tenant_id)
+            logger.info("Duplicate detected for '%s' (tenant=%s org_unit=%s)", file.filename, tenant_id, org_unit_id)
             if existing.embedding_status == "pending":
                 try:
                     chunks = split_documents(docs)
                     store_chunk_embeddings(
                         chunks=chunks, summary_id=existing.id,
                         doc_hash=file_hash, doc_name=file.filename,
-                        tenant_id=tenant_id, source_path=temp_path,
+                        tenant_id=tenant_id, org_unit_id=org_unit_id,
+                        is_ground_truth=existing.is_ground_truth,
+                        source_path=temp_path,
                     )
                 except Exception as e:
                     logger.warning("Embedding failed for existing doc: %s", e)
@@ -117,6 +158,11 @@ async def upload_document(
                     "model_used":   existing.model_used,
                     "doc_hash":     existing.doc_hash,
                     "tenant_id":    existing.tenant_id,
+                    "org_unit_id":  existing.org_unit_id,
+                    "category":     existing.category,
+                    "effective_from": str(existing.effective_from) if existing.effective_from else None,
+                    "effective_to":   str(existing.effective_to) if existing.effective_to else None,
+                    "is_ground_truth": existing.is_ground_truth,
                     "title":        existing.title,
                     "author":       existing.author,
                     "document_type": existing.document_type,
@@ -124,6 +170,7 @@ async def upload_document(
                     "key_entities": existing.key_entities,
                     "metadata_status": existing.metadata_status,
                     "image_count":  existing.image_count or 0,
+                    "preview_link": _build_preview_link(existing, tenant_id, org_unit_id),
                     "created_at":   str(existing.created_at),
                     "updated_at":   str(existing.updated_at) if existing.updated_at else None,
                     "elapsed_sec":  0.0,
@@ -162,13 +209,19 @@ async def upload_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Output validation failed: {e}")
 
-    # ── Step 5: Save summary — tenant_id stamped onto the row ──────────────
+    # ── Step 5: Save summary — tenant/org_unit + client fields stamped ──────
     try:
         record = save_summary(
             validated, file_hash, chunk_count,
-            tenant_id=tenant_id, document_metadata=document_metadata,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            document_metadata=document_metadata,
+            category=category,
+            effective_from=_to_utc_datetime(effective_from),
+            effective_to=_to_utc_datetime(effective_to),
+            is_ground_truth=is_ground_truth,
         )
-        logger.info("Saved to PostgreSQL — ID: %s (tenant=%s)", record.id, tenant_id)
+        logger.info("Saved to PostgreSQL — ID: %s (tenant=%s org_unit=%s, ground_truth=%s)",
+                   record.id, tenant_id, org_unit_id, is_ground_truth)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database save failed: {e}")
 
@@ -177,7 +230,8 @@ async def upload_document(
         store_chunk_embeddings(
             chunks=chunks, summary_id=record.id,
             doc_hash=file_hash, doc_name=file.filename,
-            tenant_id=tenant_id,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            is_ground_truth=is_ground_truth,
             source_path=temp_path, chunk_metadata=chunk_metadata,
         )
         logger.info("Text embeddings stored for '%s'", file.filename)
@@ -193,6 +247,7 @@ async def upload_document(
                 doc_hash    = file_hash,
                 doc_name    = file.filename,
                 tenant_id   = tenant_id,
+                org_unit_id = org_unit_id,
                 source_path = temp_path,
             )
             if image_inputs:
@@ -201,6 +256,8 @@ async def upload_document(
                     summary_id = record.id,
                     doc_name   = file.filename,
                     tenant_id  = tenant_id,
+                    org_unit_id = org_unit_id,
+                    is_ground_truth = is_ground_truth,
                 )
                 logger.info("Image embeddings stored: %d images", len(image_inputs))
             else:
@@ -221,6 +278,11 @@ async def upload_document(
         model_used  = record.model_used,
         doc_hash    = record.doc_hash,
         tenant_id       = record.tenant_id,
+        org_unit_id     = record.org_unit_id,
+        category        = record.category,
+        effective_from  = record.effective_from,
+        effective_to    = record.effective_to,
+        is_ground_truth = record.is_ground_truth,
         title           = record.title,
         author          = record.author,
         document_type   = record.document_type,
@@ -232,6 +294,7 @@ async def upload_document(
         confidentiality_level = record.confidentiality_level,
         metadata_status = record.metadata_status,
         image_count     = record.image_count or 0,
+        preview_link    = _build_preview_link(record, tenant_id, org_unit_id),
         created_at  = record.created_at,
         updated_at  = record.updated_at,
         elapsed_sec = raw_result.get("elapsed_sec"),
@@ -244,18 +307,26 @@ async def list_documents(
     per_page: int = Query(default=10, ge=1, le=100),
     document_type: Optional[str] = Query(default=None),
     domain:        Optional[str] = Query(default=None),
+    category:      Optional[str] = Query(default=None, description="Filter by client-defined category"),
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     offset = (page - 1) * per_page
-    # Every list is scoped to the caller's tenant — this is the query that
-    # would leak every other tenant's document titles/summaries if the
-    # filter were ever dropped.
-    query = db.query(DocumentSummary).filter(DocumentSummary.tenant_id == tenant_id)
+    # Every list is scoped to the caller's tenant AND org unit together —
+    # this is the query that would leak another tenant's, or another
+    # department's, document titles/summaries if either filter were ever
+    # dropped.
+    query = db.query(DocumentSummary).filter(
+        DocumentSummary.tenant_id == tenant_id,
+        DocumentSummary.org_unit_id == org_unit_id,
+    )
     if document_type:
         query = query.filter(DocumentSummary.document_type == document_type.lower())
     if domain:
         query = query.filter(DocumentSummary.domain == domain.lower())
+    if category:
+        query = query.filter(DocumentSummary.category == category)
 
     total  = query.count()
     records = query.order_by(DocumentSummary.created_at.desc()).offset(offset).limit(per_page).all()
@@ -268,6 +339,8 @@ async def list_documents(
             model_used     = rec.model_used,
             document_type  = rec.document_type,
             domain         = rec.domain,
+            category       = rec.category,
+            is_ground_truth = rec.is_ground_truth,
             image_count    = rec.image_count or 0,
             created_at     = rec.created_at,
             summary_preview= rec.summary_text[:200] if rec.summary_text else None,
@@ -277,18 +350,24 @@ async def list_documents(
     return DocumentListResponse(total=total, page=page, per_page=per_page, documents=items)
 
 
-@router.get("/{doc_id}", response_model=DocumentDetailResponse, summary="Get full summary by ID")
+@router.get("/{doc_id}", response_model=DocumentDetailResponse, summary="Get full summary by ID (includes preview data)")
 async def get_document(
     doc_id: uuid.UUID,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
-    # Filtered by id AND tenant_id together — a Tenant A user guessing or
-    # reusing a Tenant B document UUID gets the same 404 as a nonexistent
-    # ID, never a distinguishable "exists but isn't yours" response.
+    # Filtered by id AND tenant_id AND org_unit_id together — a user
+    # guessing or reusing a document UUID from another tenant OR another
+    # department gets the same 404 as a nonexistent ID, never a
+    # distinguishable "exists but isn't yours" response.
     record = (
         db.query(DocumentSummary)
-        .filter(DocumentSummary.id == doc_id, DocumentSummary.tenant_id == tenant_id)
+        .filter(
+            DocumentSummary.id == doc_id,
+            DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
+        )
         .first()
     )
     if not record:
@@ -298,7 +377,9 @@ async def get_document(
         key_topics=record.key_topics, page_count=record.page_count or 0,
         chunk_count=record.chunk_count or 0, source_path=record.source_path,
         language=record.language, model_used=record.model_used, doc_hash=record.doc_hash,
-        tenant_id=record.tenant_id,
+        tenant_id=record.tenant_id, org_unit_id=record.org_unit_id,
+        category=record.category, effective_from=record.effective_from,
+        effective_to=record.effective_to, is_ground_truth=record.is_ground_truth,
         title=record.title, author=record.author,
         document_type=record.document_type, domain=record.domain,
         key_entities=record.key_entities, mentioned_dates=record.mentioned_dates,
@@ -306,19 +387,63 @@ async def get_document(
         confidentiality_level=record.confidentiality_level,
         metadata_status=record.metadata_status,
         image_count=record.image_count or 0,
+        preview_link=_build_preview_link(record, tenant_id, org_unit_id),
         created_at=record.created_at, updated_at=record.updated_at,
     )
+
+
+@router.get("/{doc_id}/file", summary="Stream the original uploaded file (signed link only)")
+async def get_document_file(
+    doc_id: uuid.UUID,
+    token: str = Query(..., description="Signed token from a document's preview_link — not usable on its own"),
+    db: Session = Depends(get_db_session_fastapi),
+):
+    """
+    Authorized via a signed token in the URL, NOT via X-Tenant-ID/
+    X-Org-Unit-ID headers — this endpoint is meant to be hit as a plain
+    clickable link or <iframe src>, and browsers don't attach custom
+    headers to those. The token (see utils/signed_link.py) encodes which
+    document, which tenant, which org unit, and an expiry — generated
+    fresh every time GET /documents/{id} is called, valid for
+    settings.FILE_LINK_TTL_SECONDS (15 minutes by default).
+    """
+    payload = verify_file_token(token)
+    if not payload or payload.get("doc_id") != str(doc_id):
+        raise HTTPException(status_code=403, detail="Invalid or expired link")
+
+    record = (
+        db.query(DocumentSummary)
+        .filter(
+            DocumentSummary.id == doc_id,
+            DocumentSummary.tenant_id == payload["tenant_id"],
+            DocumentSummary.org_unit_id == payload["org_unit_id"],
+        )
+        .first()
+    )
+    if not record or not record.source_path:
+        raise HTTPException(status_code=404, detail="File not found")
+    if record.source_path.startswith("http://") or record.source_path.startswith("https://"):
+        raise HTTPException(status_code=400, detail="This document has no local file — it was web-scraped; use its source URL directly")
+    if not os.path.exists(record.source_path):
+        raise HTTPException(status_code=404, detail="File no longer exists on disk")
+
+    return FileResponse(record.source_path, filename=record.doc_name)
 
 
 @router.patch("/{doc_id}", response_model=DocumentUpdateResponse, summary="Update document name")
 async def update_document(
     doc_id: uuid.UUID, payload: DocumentUpdateRequest,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     record = (
         db.query(DocumentSummary)
-        .filter(DocumentSummary.id == doc_id, DocumentSummary.tenant_id == tenant_id)
+        .filter(
+            DocumentSummary.id == doc_id,
+            DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
+        )
         .first()
     )
     if not record:
@@ -333,11 +458,16 @@ async def update_document(
 async def delete_document(
     doc_id: uuid.UUID,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     record = (
         db.query(DocumentSummary)
-        .filter(DocumentSummary.id == doc_id, DocumentSummary.tenant_id == tenant_id)
+        .filter(
+            DocumentSummary.id == doc_id,
+            DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
+        )
         .first()
     )
     if not record:

@@ -22,6 +22,7 @@ plain input.
 from fastapi import Header, HTTPException
 
 _MAX_TENANT_ID_LENGTH = 128
+_MAX_ORG_UNIT_ID_LENGTH = 128
 
 
 def get_tenant_id(x_tenant_id: str = Header(..., alias="X-Tenant-ID")) -> str:
@@ -39,3 +40,24 @@ def get_tenant_id(x_tenant_id: str = Header(..., alias="X-Tenant-ID")) -> str:
     if len(tenant_id) > _MAX_TENANT_ID_LENGTH:
         raise HTTPException(status_code=400, detail="X-Tenant-ID header is too long")
     return tenant_id
+
+
+def get_org_unit_id(x_org_unit_id: str = Header(..., alias="X-Org-Unit-ID")) -> str:
+    """
+    FastAPI dependency — second, required isolation identifier, same
+    trust model as get_tenant_id: sourced from a header set by the
+    frontend/gateway from the logged-in user's session, never typed by
+    the user directly. Every route that also depends on get_tenant_id
+    must depend on this too — org_unit_id is a hard boundary WITHIN a
+    tenant (department-level), always applied together with tenant_id,
+    never filtered on its own (see db/models.py composite indexes —
+    a standalone org_unit_id filter would let a department code that
+    happens to collide across two different tenants leak across
+    companies, not just across departments).
+    """
+    org_unit_id = (x_org_unit_id or "").strip()
+    if not org_unit_id:
+        raise HTTPException(status_code=400, detail="X-Org-Unit-ID header is required")
+    if len(org_unit_id) > _MAX_ORG_UNIT_ID_LENGTH:
+        raise HTTPException(status_code=400, detail="X-Org-Unit-ID header is too long")
+    return org_unit_id

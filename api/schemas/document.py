@@ -2,7 +2,11 @@
 api/schemas/document.py
 -----------------------
 Pydantic schemas for request and response validation.
-NEW: image_count added to all response schemas.
+
+NEW: org_unit_id, category, effective_from/to, is_ground_truth, and
+preview_link added to all document response schemas. title is
+deliberately NOT a client-supplied field anywhere — it stays
+LLM-generated only (see pipeline/storage.py).
 """
 
 from datetime import datetime
@@ -23,7 +27,12 @@ class DocumentUploadResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
-    tenant_id:    Optional[str] = None   # NEW — which tenant this document belongs to
+    tenant_id:    Optional[str] = None   # which tenant this document belongs to
+    org_unit_id:  Optional[str] = None   # NEW — which department, within that tenant
+    category:        Optional[str] = None   # NEW — client-defined free text
+    effective_from:  Optional[datetime] = None   # NEW — metadata only, no retrieval effect
+    effective_to:    Optional[datetime] = None   # NEW — metadata only, no retrieval effect
+    is_ground_truth: Optional[bool] = None       # NEW — gates retrieval
     title:                  Optional[str] = None
     author:                 Optional[str] = None
     document_type:          Optional[str] = None
@@ -34,7 +43,8 @@ class DocumentUploadResponse(BaseModel):
     sentiment:               Optional[str] = None
     confidentiality_level:  Optional[str] = None
     metadata_status:         Optional[str] = None
-    image_count:             Optional[int] = 0   # NEW
+    image_count:             Optional[int] = 0
+    preview_link:            Optional[str] = None   # NEW — signed file link or source URL
     created_at:   datetime
     updated_at:   Optional[datetime] = None
     elapsed_sec:  Optional[float] = None
@@ -51,7 +61,9 @@ class DocumentListItem(BaseModel):
     model_used:  Optional[str] = None
     document_type: Optional[str] = None
     domain:        Optional[str] = None
-    image_count:   Optional[int] = 0   # NEW
+    category:      Optional[str] = None    # NEW
+    is_ground_truth: Optional[bool] = None  # NEW
+    image_count:   Optional[int] = 0
     created_at:  datetime
     summary_preview: Optional[str] = None
 
@@ -67,6 +79,13 @@ class DocumentListResponse(BaseModel):
 
 
 class DocumentDetailResponse(BaseModel):
+    """
+    Also serves as the preview payload — no separate preview endpoint.
+    Everything a preview UI needs is already here: summary, title,
+    tenant_id, org_unit_id, category, effective dates, ground-truth flag,
+    and preview_link (signed file link for uploads, source URL for
+    web-scraped documents).
+    """
     id:           UUID
     doc_name:     str
     summary_text: str
@@ -77,7 +96,12 @@ class DocumentDetailResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
-    tenant_id:    Optional[str] = None   # NEW — which tenant this document belongs to
+    tenant_id:    Optional[str] = None
+    org_unit_id:  Optional[str] = None
+    category:        Optional[str] = None
+    effective_from:  Optional[datetime] = None
+    effective_to:    Optional[datetime] = None
+    is_ground_truth: Optional[bool] = None
     title:                  Optional[str] = None
     author:                 Optional[str] = None
     document_type:          Optional[str] = None
@@ -88,7 +112,8 @@ class DocumentDetailResponse(BaseModel):
     sentiment:               Optional[str] = None
     confidentiality_level:  Optional[str] = None
     metadata_status:         Optional[str] = None
-    image_count:             Optional[int] = 0   # NEW
+    image_count:             Optional[int] = 0
+    preview_link:            Optional[str] = None
     created_at:   datetime
     updated_at:   Optional[datetime] = None
 

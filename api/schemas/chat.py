@@ -132,7 +132,8 @@ class ThreadResponse(BaseModel):
     message_count: int
     created_at:    datetime
     updated_at:    Optional[datetime]
-    tenant_id:     Optional[str] = None   # NEW — which tenant this thread belongs to
+    tenant_id:     Optional[str] = None   # which tenant this thread belongs to
+    org_unit_id:   Optional[str] = None   # NEW — which department, within that tenant
 
     class Config:
         from_attributes = True

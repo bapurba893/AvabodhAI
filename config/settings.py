@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     IMAGE_MAX_DIMENSION: int = 1024        # resize longest side to this before sending to Vision
     IMAGE_MAX_WORKERS: int = 4             # ThreadPoolExecutor size for parallel image embedding
 
+    # ── Signed preview file links ───────────────────────────────────────────
+    # A plain <a href> or <iframe src> can't carry X-Tenant-ID/X-Org-Unit-ID
+    # headers, so the document-file endpoint is authorized via a short-lived
+    # HMAC-signed token in the URL instead. SECRET_KEY MUST be overridden in
+    # production — the default below is fine for local dev only, and is
+    # deliberately obviously-not-secret so nobody mistakes it for a real one.
+    SECRET_KEY: str = "dev-only-CHANGE-ME-in-production"
+    FILE_LINK_TTL_SECONDS: int = 900       # 15 minutes
+
 
     # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"

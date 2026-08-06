@@ -10,16 +10,34 @@ Three modes — controlled by the request body:
   - Batch pages  : 2-10 URLs, full_site=False → scrape each page
   - Full website : 1 URL,  full_site=True   → BFS crawl whole site
 
-NEW: After text pipeline, images from each page are extracted,
-     captioned with GPT-4o Vision, and embedded into pgvector.
+After text pipeline, images from each page are extracted, captioned
+with GPT-4o Vision, and embedded into pgvector.
+
+Multi-tenancy + department isolation: the endpoint takes tenant_id AND
+org_unit_id from the X-Tenant-ID / X-Org-Unit-ID headers and threads
+both through every save/store/dedup call for every page — scraped
+content is exactly as isolated as an uploaded document.
+
+Client-supplied fields (category, effective_from/to, is_ground_truth)
+apply the same way as document upload — the same values are stamped
+onto every page scraped in one request, since they describe the request
+as a whole (a "scrape this policy site" request is one category, one
+ground-truth decision, applied to everything it finds).
+
+Preview link: for scraped pages this is trivially just the source URL
+(no signed token needed — there's no local file to protect access to,
+the page is already public at that URL).
 """
 
-from typing import List
+from datetime import date, datetime, timezone
+from typing import List, Optional
+
 from bs4 import BeautifulSoup
 
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 
+from api.dependencies import get_tenant_id, get_org_unit_id
 from api.schemas.web import WebScrapeRequest, WebScrapeResponse, PageResult, PageData
 from db.database import get_db_session_fastapi
 from pipeline.scraper import scrape_url_async, scrape_website_async
@@ -34,6 +52,13 @@ router = APIRouter()
 logger = get_logger(__name__)
 
 
+def _to_utc_datetime(d: Optional[date]) -> Optional[datetime]:
+    """Convert a plain date (from the request body) to a tz-aware datetime for storage."""
+    if d is None:
+        return None
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+
 # ─────────────────────────────────────────────────────────────
 # Helper — extract and embed images from a scraped page
 # ─────────────────────────────────────────────────────────────
@@ -45,6 +70,9 @@ def _wire_web_images(
     summary_id,
     doc_hash:   str,
     doc_name:   str,
+    tenant_id:  str,
+    org_unit_id: str,
+    is_ground_truth: bool,
 ) -> None:
     """
     Parse HTML, extract images, caption with GPT-4o Vision, embed.
@@ -60,7 +88,9 @@ def _wire_web_images(
             doc_hash    = doc_hash,
             source_path = page_url,
             page_text   = page_text,
-            hash_exists_fn = check_image_hash_exists,
+            # Wrap the tenant+org-scoped dedup check as a plain (hash) -> bool
+            # callable so image_processor.py stays decoupled from embedder.py.
+            hash_exists_fn = lambda h: check_image_hash_exists(h, tenant_id, org_unit_id),
         )
         if image_dicts:
             image_inputs = [ImageEmbeddingInput(**d) for d in image_dicts]
@@ -68,6 +98,9 @@ def _wire_web_images(
                 images     = image_inputs,
                 summary_id = summary_id,
                 doc_name   = doc_name,
+                tenant_id  = tenant_id,
+                org_unit_id = org_unit_id,
+                is_ground_truth = is_ground_truth,
             )
             logger.info("Web images embedded: %d from '%s'", len(image_inputs), page_url[:60])
     except Exception as e:
@@ -75,13 +108,19 @@ def _wire_web_images(
 
 
 # ─────────────────────────────────────────────────────────────
-# Internal helpers (text pipeline unchanged)
+# Internal helpers (text pipeline)
 # ─────────────────────────────────────────────────────────────
 
 async def _process_single_url(
     url: str,
     wait_for_selector: str | None,
     extra_wait_ms: int,
+    tenant_id: str,
+    org_unit_id: str,
+    category: Optional[str],
+    effective_from: Optional[datetime],
+    effective_to: Optional[datetime],
+    is_ground_truth: bool,
     db: Session,
 ) -> dict:
     try:
@@ -102,15 +141,18 @@ async def _process_single_url(
         return {"url": url, "status": "error", "error": f"Scrape failed: {e}"}
 
     if file_hash:
-        existing = check_duplicate(file_hash)
+        existing = check_duplicate(file_hash, tenant_id, org_unit_id)
         if existing:
-            logger.info("Duplicate detected: %s", url)
+            logger.info("Duplicate detected: %s (tenant=%s org_unit=%s)", url, tenant_id, org_unit_id)
             if existing.embedding_status == "pending":
                 try:
                     chunks = split_documents(docs)
                     store_chunk_embeddings(
                         chunks=chunks, summary_id=existing.id,
-                        doc_hash=file_hash, doc_name=existing.doc_name, source_path=url,
+                        doc_hash=file_hash, doc_name=existing.doc_name,
+                        tenant_id=tenant_id, org_unit_id=org_unit_id,
+                        is_ground_truth=existing.is_ground_truth,
+                        source_path=url,
                     )
                 except Exception as e:
                     logger.warning("Embedding retry failed: %s", e)
@@ -124,6 +166,10 @@ async def _process_single_url(
                     page_count=existing.page_count, chunk_count=existing.chunk_count,
                     source_path=existing.source_path, language=existing.language,
                     model_used=existing.model_used, doc_hash=existing.doc_hash,
+                    tenant_id=existing.tenant_id, org_unit_id=existing.org_unit_id,
+                    category=existing.category, effective_from=existing.effective_from,
+                    effective_to=existing.effective_to, is_ground_truth=existing.is_ground_truth,
+                    preview_link=url,
                     created_at=existing.created_at, updated_at=existing.updated_at,
                     elapsed_sec=0.0, message="Duplicate — returning cached summary",
                 ),
@@ -154,20 +200,28 @@ async def _process_single_url(
         return {"url": url, "status": "error", "error": f"Validation failed: {e}"}
 
     try:
-        record = save_summary(validated, file_hash, chunk_count, document_metadata=document_metadata)
+        record = save_summary(
+            validated, file_hash, chunk_count,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            document_metadata=document_metadata,
+            category=category, effective_from=effective_from,
+            effective_to=effective_to, is_ground_truth=is_ground_truth,
+        )
     except Exception as e:
         return {"url": url, "status": "error", "error": f"Database save failed: {e}"}
 
     try:
         store_chunk_embeddings(
             chunks=chunks, summary_id=record.id,
-            doc_hash=file_hash, doc_name=page_title, source_path=url,
-            chunk_metadata=chunk_metadata,
+            doc_hash=file_hash, doc_name=page_title,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            is_ground_truth=is_ground_truth,
+            source_path=url, chunk_metadata=chunk_metadata,
         )
     except Exception as e:
         logger.warning("Text embedding storage failed (non-fatal): %s", e)
 
-    # ── NEW — Extract and embed images from web page ───────────────────────
+    # ── Extract and embed images from web page ─────────────────────────────
     if raw_html:
         _wire_web_images(
             html       = raw_html,
@@ -176,6 +230,9 @@ async def _process_single_url(
             summary_id = record.id,
             doc_hash   = file_hash,
             doc_name   = page_title,
+            tenant_id  = tenant_id,
+            org_unit_id = org_unit_id,
+            is_ground_truth = is_ground_truth,
         )
 
     return {
@@ -188,13 +245,22 @@ async def _process_single_url(
             page_count=record.page_count, chunk_count=record.chunk_count,
             source_path=record.source_path, language=record.language,
             model_used=record.model_used, doc_hash=record.doc_hash,
+            tenant_id=record.tenant_id, org_unit_id=record.org_unit_id,
+            category=record.category, effective_from=record.effective_from,
+            effective_to=record.effective_to, is_ground_truth=record.is_ground_truth,
+            preview_link=url,
             created_at=record.created_at, updated_at=record.updated_at,
             elapsed_sec=raw_result.get("elapsed_sec"),
         ),
     }
 
 
-async def _process_crawled_doc(doc, db: Session) -> PageResult:
+async def _process_crawled_doc(
+    doc, tenant_id: str, org_unit_id: str,
+    category: Optional[str], effective_from: Optional[datetime],
+    effective_to: Optional[datetime], is_ground_truth: bool,
+    db: Session,
+) -> PageResult:
     url        = doc.metadata.get("source", "unknown")
     file_hash  = doc.metadata.get("file_hash", "")
     page_title = doc.metadata.get("title") or url
@@ -202,7 +268,7 @@ async def _process_crawled_doc(doc, db: Session) -> PageResult:
     page_text  = doc.page_content
 
     if file_hash:
-        existing = check_duplicate(file_hash)
+        existing = check_duplicate(file_hash, tenant_id, org_unit_id)
         if existing:
             return PageResult(url=url, status="duplicate", detail="Already in knowledge base")
 
@@ -227,20 +293,28 @@ async def _process_crawled_doc(doc, db: Session) -> PageResult:
         return PageResult(url=url, status="error", detail=f"Validation failed: {e}")
 
     try:
-        record = save_summary(validated, file_hash, chunk_count, document_metadata=document_metadata)
+        record = save_summary(
+            validated, file_hash, chunk_count,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            document_metadata=document_metadata,
+            category=category, effective_from=effective_from,
+            effective_to=effective_to, is_ground_truth=is_ground_truth,
+        )
     except Exception as e:
         return PageResult(url=url, status="error", detail=f"DB save failed: {e}")
 
     try:
         store_chunk_embeddings(
             chunks=chunks, summary_id=record.id,
-            doc_hash=file_hash, doc_name=page_title, source_path=url,
-            chunk_metadata=chunk_metadata,
+            doc_hash=file_hash, doc_name=page_title,
+            tenant_id=tenant_id, org_unit_id=org_unit_id,
+            is_ground_truth=is_ground_truth,
+            source_path=url, chunk_metadata=chunk_metadata,
         )
     except Exception as e:
         logger.warning("Text embedding storage failed (non-fatal): %s", e)
 
-    # ── NEW — Extract and embed images ─────────────────────────────────────
+    # ── Extract and embed images ────────────────────────────────────────────
     if raw_html:
         _wire_web_images(
             html       = raw_html,
@@ -249,6 +323,9 @@ async def _process_crawled_doc(doc, db: Session) -> PageResult:
             summary_id = record.id,
             doc_hash   = file_hash,
             doc_name   = page_title,
+            tenant_id  = tenant_id,
+            org_unit_id = org_unit_id,
+            is_ground_truth = is_ground_truth,
         )
 
     return PageResult(
@@ -261,6 +338,10 @@ async def _process_crawled_doc(doc, db: Session) -> PageResult:
             page_count=record.page_count, chunk_count=record.chunk_count,
             source_path=record.source_path, language=record.language,
             model_used=record.model_used, doc_hash=record.doc_hash,
+            tenant_id=record.tenant_id, org_unit_id=record.org_unit_id,
+            category=record.category, effective_from=record.effective_from,
+            effective_to=record.effective_to, is_ground_truth=record.is_ground_truth,
+            preview_link=url,
             created_at=record.created_at, updated_at=record.updated_at,
             elapsed_sec=raw_result.get("elapsed_sec"),
         ),
@@ -268,7 +349,7 @@ async def _process_crawled_doc(doc, db: Session) -> PageResult:
 
 
 # ─────────────────────────────────────────────────────────────
-# THE ONE ENDPOINT (unchanged contract)
+# THE ONE ENDPOINT (unchanged contract, now tenant+org-scoped)
 # ─────────────────────────────────────────────────────────────
 
 @router.post(
@@ -288,13 +369,18 @@ Single endpoint for all web scraping modes:
 )
 async def scrape(
     body: WebScrapeRequest,
+    tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     results: List[PageResult] = []
+    effective_from = _to_utc_datetime(body.effective_from)
+    effective_to   = _to_utc_datetime(body.effective_to)
 
     if body.full_site:
         url = str(body.urls[0])
-        logger.info("Full site crawl: %s (max_pages=%d)", url, body.max_pages)
+        logger.info("Full site crawl: %s (max_pages=%d, tenant=%s org_unit=%s)",
+                   url, body.max_pages, tenant_id, org_unit_id)
 
         try:
             docs = await scrape_website_async(
@@ -310,7 +396,11 @@ async def scrape(
             raise HTTPException(status_code=404, detail="No pages found at the given URL.")
 
         for doc in docs:
-            item = await _process_crawled_doc(doc, db)
+            item = await _process_crawled_doc(
+                doc, tenant_id, org_unit_id,
+                body.category, effective_from, effective_to, body.is_ground_truth,
+                db,
+            )
             results.append(item)
 
         mode = "full_site"
@@ -318,7 +408,12 @@ async def scrape(
     else:
         for url_obj in body.urls:
             url = str(url_obj)
-            outcome = await _process_single_url(url, body.wait_for_selector, body.extra_wait_ms, db)
+            outcome = await _process_single_url(
+                url, body.wait_for_selector, body.extra_wait_ms,
+                tenant_id, org_unit_id,
+                body.category, effective_from, effective_to, body.is_ground_truth,
+                db,
+            )
             results.append(PageResult(
                 url=outcome["url"],
                 status=outcome["status"],

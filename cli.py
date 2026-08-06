@@ -4,10 +4,9 @@ main.py
 Entry point — run from terminal or call from your API/backend.
 
 Usage:
-    python main.py                          # process all docs in DOCUMENTS_DIR
-    python main.py --file path/to/doc.pdf   # process one file
-    python main.py --dir path/to/folder     # process a specific folder
-    python main.py --check-db               # test DB connection only
+    python cli.py --file path/to/doc.pdf --tenant-id t1 --org-unit-id d1
+    python cli.py --dir path/to/folder --tenant-id t1 --org-unit-id d1
+    python cli.py --check-db
 """
 import sys
 import os
@@ -25,7 +24,7 @@ logger = get_logger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ababoth — Document summarisation pipeline"
+        description="Avabodh — Document summarisation pipeline"
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--file", type=str, help="Process a single document")
@@ -34,6 +33,16 @@ def main() -> None:
     parser.add_argument(
         "--tenant-id", type=str, default=None,
         help="Tenant to attribute processed documents to. Required unless --check-db.",
+    )
+    parser.add_argument(
+        "--org-unit-id", type=str, default=None,
+        help="Department/org unit within that tenant. Required unless --check-db.",
+    )
+    parser.add_argument(
+        "--ground-truth", action="store_true",
+        help="Mark processed documents as ground truth (retrievable by chat/search). "
+             "Default is False, matching the API upload default — omit this flag to "
+             "load documents that won't be retrievable until explicitly marked later.",
     )
 
     args = parser.parse_args()
@@ -44,13 +53,18 @@ def main() -> None:
         print("DB connection: OK" if ok else "DB connection: FAILED")
         sys.exit(0 if ok else 1)
 
-    # This is a standalone CLI tool — no gateway header to read tenant_id
-    # from, so it must be passed explicitly. Refusing to default it to
-    # something like "default" is deliberate: a forgotten --tenant-id
-    # flag should fail loudly, not silently file documents under the
-    # wrong tenant.
+    # This is a standalone CLI tool — no gateway headers to read tenant_id
+    # or org_unit_id from, so both must be passed explicitly. Refusing to
+    # default either to something like "default" is deliberate: a
+    # forgotten flag should fail loudly, not silently file documents
+    # under the wrong tenant or department.
+    missing = []
     if not args.tenant_id:
-        print("Error: --tenant-id is required (unless using --check-db)")
+        missing.append("--tenant-id")
+    if not args.org_unit_id:
+        missing.append("--org-unit-id")
+    if missing:
+        print(f"Error: {' and '.join(missing)} required (unless using --check-db)")
         sys.exit(1)
 
     # ── Ensure tables exist ───────────────────────────────────────────────
@@ -58,7 +72,7 @@ def main() -> None:
 
     # ── Single file ───────────────────────────────────────────────────────
     if args.file:
-        result = process_single_document(args.file, args.tenant_id)
+        result = process_single_document(args.file, args.tenant_id, args.org_unit_id, args.ground_truth)
         if result.success and not result.skipped:
             print(f"✓ Summary saved — ID: {result.summary_id}")
         elif result.skipped:
@@ -69,7 +83,7 @@ def main() -> None:
 
     # ── Directory ─────────────────────────────────────────────────────────
     else:
-        report = process_directory(args.tenant_id, args.dir)
+        report = process_directory(args.tenant_id, args.org_unit_id, args.dir, args.ground_truth)
         print(
             f"\nDone — {report.succeeded} saved | "
             f"{report.skipped} skipped | {report.failed} failed"

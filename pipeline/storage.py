@@ -3,7 +3,7 @@ pipeline/storage.py
 -------------------
 Steps 5 + 6 + 7 — Pydantic validation → Structured object → Save to PostgreSQL
 
-NEW: Also saves document-level metadata (title, author, document_type, domain,
+Also saves document-level metadata (title, author, document_type, domain,
 key_entities, mentioned_dates, target_audience, sentiment, confidentiality_level)
 extracted by summariser.py, into the same document_summaries row.
 
@@ -11,6 +11,11 @@ Also handles:
 - Deduplication: if this exact file (same SHA-256 hash) was already summarised,
   skip the LLM entirely and return the cached summary — saves cost
 - Upsert logic: if doc_name exists but hash changed (file updated), update the row
+
+Both dedup lookups are scoped by (tenant_id, org_unit_id) together — never
+either one alone. org_unit_id is a hard boundary WITHIN a tenant (department-
+level), so a standalone org_unit_id match would leak across companies if two
+different tenants happen to use the same department code.
 """
 
 from datetime import datetime, timezone
@@ -53,13 +58,12 @@ def validate_summary(raw: dict, metadata: dict) -> DocumentSummaryOutput:
         raise ValueError(f"Summary output failed validation: {e}") from e
 
 
-def check_duplicate(file_hash: str, tenant_id: str) -> Optional[DocumentSummary]:
+def check_duplicate(file_hash: str, tenant_id: str, org_unit_id: str) -> Optional[DocumentSummary]:
     """
     Check if this exact file was already summarised — scoped to this
-    tenant. Deliberately scoped by (tenant_id, doc_hash) together, NOT
-    doc_hash alone: two tenants uploading the same publicly available
-    file (a vendor spec sheet, a public report) must not see each
-    other's cached summary.
+    tenant AND org unit together. Two tenants (or two departments within
+    the same tenant) uploading the same publicly available file (a vendor
+    spec sheet, a public report) must not see each other's cached summary.
     Returns the existing DB record if found, else None.
     """
     with get_db_session_context() as session:
@@ -68,13 +72,14 @@ def check_duplicate(file_hash: str, tenant_id: str) -> Optional[DocumentSummary]
             .filter(
                 DocumentSummary.doc_hash == file_hash,
                 DocumentSummary.tenant_id == tenant_id,
+                DocumentSummary.org_unit_id == org_unit_id,
             )
             .first()
         )
         if existing:
             logger.info(
-                "Duplicate detected — '%s' already summarised for tenant=%s (hash=%s). Skipping LLM.",
-                existing.doc_name, tenant_id, file_hash[:12],
+                "Duplicate detected — '%s' already summarised for tenant=%s org_unit=%s (hash=%s). Skipping LLM.",
+                existing.doc_name, tenant_id, org_unit_id, file_hash[:12],
             )
             session.expunge(existing)
             make_transient(existing)
@@ -84,8 +89,8 @@ def check_duplicate(file_hash: str, tenant_id: str) -> Optional[DocumentSummary]
 
 def _apply_document_metadata(record: DocumentSummary, doc_metadata: Optional[DocumentMetadataOutput]) -> None:
     """
-    NEW — Apply extracted document-level metadata onto a DocumentSummary
-    ORM instance. Shared by both insert and update paths.
+    Apply extracted document-level metadata onto a DocumentSummary ORM
+    instance. Shared by both insert and update paths.
     Sets metadata_status='completed' on success, 'failed' if extraction
     was unavailable (non-fatal — summary still saves either way).
     """
@@ -112,51 +117,61 @@ def save_summary(
     file_hash: str,
     chunk_count: int,
     tenant_id: str,
+    org_unit_id: str,
     document_metadata: Optional[DocumentMetadataOutput] = None,
+    category: Optional[str] = None,
+    effective_from: Optional[datetime] = None,
+    effective_to: Optional[datetime] = None,
+    is_ground_truth: bool = False,
 ) -> DocumentSummary:
     """
     Step 7 — Save the structured summary to PostgreSQL.
-    - If same tenant + hash exists → skip (already saved)
-    - If same tenant + doc_name exists but different hash → update (file was changed)
+    - If same tenant+org_unit + hash exists → skip (already saved)
+    - If same tenant+org_unit + doc_name exists but different hash → update
     - Otherwise → insert new row
 
-    tenant_id scopes BOTH lookups below. Without it, two tenants uploading
-    a same-named file (e.g. two different "resume.pdf") would silently
-    overwrite each other's row via the doc_name upsert path — this is the
-    sharper of the two dedup bugs closed by this change.
+    tenant_id + org_unit_id together scope BOTH lookups below — a
+    standalone tenant_id match isn't enough now that departments within
+    one tenant are also isolated from each other; without org_unit_id
+    too, Department A's "invoice.pdf" could silently overwrite
+    Department B's via the doc_name upsert path.
 
-    NEW: document_metadata (if provided) is applied to the row in all paths.
+    title is intentionally NOT a parameter here — it stays LLM-generated
+    only, applied via _apply_document_metadata(), never user-supplied.
 
     Returns the saved/updated ORM record.
     """
     with get_db_session_context() as session:
 
-        # Check if this exact hash already in DB for this tenant (full dedup)
+        # Check if this exact hash already in DB for this tenant+org_unit
         existing = (
             session.query(DocumentSummary)
             .filter(
                 DocumentSummary.doc_hash == file_hash,
                 DocumentSummary.tenant_id == tenant_id,
+                DocumentSummary.org_unit_id == org_unit_id,
             )
             .first()
         )
         if existing:
             logger.info(
-                "Record already exists for tenant=%s hash=%s — no DB write needed.",
-                tenant_id, file_hash[:12],
+                "Record already exists for tenant=%s org_unit=%s hash=%s — no DB write needed.",
+                tenant_id, org_unit_id, file_hash[:12],
             )
             session.expunge(existing)
             make_transient(existing)
             return existing
 
-        # Check if same filename exists for this tenant with different hash
-        # (file updated) — scoped by tenant_id so Tenant A's "invoice.pdf"
-        # can never match Tenant B's "invoice.pdf".
+        # Check if same filename exists for this tenant+org_unit with a
+        # different hash (file updated) — scoped by BOTH so Department A's
+        # "invoice.pdf" can never match Department B's, even within the
+        # same tenant.
         same_name = (
             session.query(DocumentSummary)
             .filter(
                 DocumentSummary.doc_name == validated.doc_name,
                 DocumentSummary.tenant_id == tenant_id,
+                DocumentSummary.org_unit_id == org_unit_id,
             )
             .first()
         )
@@ -172,12 +187,16 @@ def save_summary(
             same_name.updated_at   = datetime.now(timezone.utc)
             same_name.embedding_status = "pending"
             same_name.embedding_model  = None
+            same_name.category         = category
+            same_name.effective_from   = effective_from
+            same_name.effective_to     = effective_to
+            same_name.is_ground_truth  = is_ground_truth
             _apply_document_metadata(same_name, document_metadata)
             session.add(same_name)
             session.flush()
             logger.info(
-                "Updated existing summary for tenant=%s '%s' (file changed)",
-                tenant_id, validated.doc_name,
+                "Updated existing summary for tenant=%s org_unit=%s '%s' (file changed)",
+                tenant_id, org_unit_id, validated.doc_name,
             )
             session.expunge(same_name)
             make_transient(same_name)
@@ -186,6 +205,7 @@ def save_summary(
         # New document — insert fresh row
         record = DocumentSummary(
             tenant_id         = tenant_id,
+            org_unit_id       = org_unit_id,
             doc_name          = validated.doc_name,
             summary_text      = validated.summary_text,
             key_topics        = ", ".join(validated.key_topics),
@@ -200,13 +220,17 @@ def save_summary(
             embedding_model   = None,           # filled by embedder after storing
             avg_chunk_size    = None,           # filled by embedder
             embedding_stored_at = None,         # filled by embedder
+            category          = category,
+            effective_from    = effective_from,
+            effective_to      = effective_to,
+            is_ground_truth   = is_ground_truth,
         )
         _apply_document_metadata(record, document_metadata)
         session.add(record)
         session.flush()  # get the ID before session closes
         logger.info(
-            "Saved new summary for tenant=%s '%s' to PostgreSQL (metadata_status=%s)",
-            tenant_id, validated.doc_name, record.metadata_status,
+            "Saved new summary for tenant=%s org_unit=%s '%s' to PostgreSQL (metadata_status=%s, ground_truth=%s)",
+            tenant_id, org_unit_id, validated.doc_name, record.metadata_status, is_ground_truth,
         )
         session.expunge(record)  # detach from session so it can be used outside
         make_transient(record)

@@ -13,10 +13,11 @@ Multimodal chat:
             the retrieved context — GPT-4o literally sees the pixels
             and answers using document knowledge simultaneously
 
-Multi-tenancy: every endpoint takes tenant_id from the X-Tenant-ID header
-(via api.dependencies.get_tenant_id). Thread creation/lookup, message
-storage, and document retrieval are all scoped by it — a Tenant A chat
-can never surface Tenant B's documents or thread history.
+Multi-tenancy + department isolation: every endpoint takes tenant_id AND
+org_unit_id from the X-Tenant-ID / X-Org-Unit-ID headers. Thread
+creation/lookup, message storage, and document retrieval are all scoped
+by BOTH together — a chat can never surface another tenant's, or another
+department's, documents or thread history.
 """
 
 import base64
@@ -29,7 +30,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
 from openai import OpenAI
 
-from api.dependencies import get_tenant_id
+from api.dependencies import get_tenant_id, get_org_unit_id
 from api.schemas.chat import (
     ChatMessageRequest,
     ChatMessageResponse,
@@ -76,6 +77,7 @@ def _retrieve_with_image(
     image_media_type: str,
     db:            Session,
     tenant_id:     str,
+    org_unit_id:   str,
     top_k:         int = 5,
     doc_filter:    Optional[str] = None,
 ) -> tuple[list[dict], Optional[str]]:
@@ -84,7 +86,7 @@ def _retrieve_with_image(
     1. Caption it with GPT-4o Vision to understand what it shows
     2. Build composite embedding text from caption
     3. Use that text to search pgvector (finds both text AND image chunks) —
-       scoped to tenant_id like every other retrieval path
+       scoped to tenant_id + org_unit_id like every other retrieval path
     Returns (chunks, image_caption_text)
     """
     try:
@@ -99,7 +101,8 @@ def _retrieve_with_image(
 
         if caption is None:
             logger.warning("Vision captioning of user image failed — falling back to text search")
-            return retrieve(query=query, db=db, tenant_id=tenant_id, top_k=top_k, doc_filter=doc_filter), None
+            return retrieve(query=query, db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
+                           top_k=top_k, doc_filter=doc_filter), None
 
         # Build rich search text from caption
         caption_search_text = build_image_embedding_text(
@@ -114,12 +117,14 @@ def _retrieve_with_image(
             query_vector=query_vector,
             db=db,
             tenant_id=tenant_id,
+            org_unit_id=org_unit_id,
             top_k=top_k * 2,
             doc_filter=doc_filter,
         )
 
         # Also search with the original text query and merge results
-        text_chunks = retrieve(query=query, db=db, tenant_id=tenant_id, top_k=top_k, doc_filter=doc_filter)
+        text_chunks = retrieve(query=query, db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
+                              top_k=top_k, doc_filter=doc_filter)
 
         # Merge — deduplicate by chunk id, keep highest similarity
         seen_ids = set()
@@ -142,7 +147,8 @@ def _retrieve_with_image(
 
     except Exception as e:
         logger.warning("Image-aware retrieval failed — falling back to text: %s", e)
-        return retrieve(query=query, db=db, tenant_id=tenant_id, top_k=top_k, doc_filter=doc_filter), None
+        return retrieve(query=query, db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
+                       top_k=top_k, doc_filter=doc_filter), None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,23 +206,24 @@ def _chat_complete_with_image(
 # Shared chat preparation
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, db: Session) -> tuple:
+async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, org_unit_id: str, db: Session) -> tuple:
     is_new_thread = False
     if request.thread_id is None:
-        thread = create_thread(tenant_id=tenant_id, doc_filter=request.doc_filter)
+        thread = create_thread(tenant_id=tenant_id, org_unit_id=org_unit_id, doc_filter=request.doc_filter)
         thread_id = str(thread.id)
         is_new_thread = True
     else:
         thread_id = str(request.thread_id)
-        # Scoped by tenant_id — a thread_id belonging to another tenant
-        # returns None here exactly like a nonexistent one.
-        thread = get_thread(thread_id, tenant_id, db)
+        # Scoped by tenant_id + org_unit_id — a thread_id belonging to
+        # another tenant OR another department returns None here exactly
+        # like a nonexistent one.
+        thread = get_thread(thread_id, tenant_id, org_unit_id, db)
         if not thread:
             raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
 
-    memory = load_memory_from_db(thread_id, tenant_id, db)
+    memory = load_memory_from_db(thread_id, tenant_id, org_unit_id, db)
 
-    # ── Retrieval — image-aware if image attached, always tenant-scoped ────
+    # ── Retrieval — image-aware if image attached, always scoped ───────────
     if request.image_base64:
         chunks, image_caption = _retrieve_with_image(
             query            = request.query,
@@ -224,12 +231,13 @@ async def _prepare_chat(request: ChatMessageRequest, tenant_id: str, db: Session
             image_media_type = request.image_media_type or "image/jpeg",
             db               = db,
             tenant_id        = tenant_id,
+            org_unit_id      = org_unit_id,
             top_k            = request.top_k,
             doc_filter       = request.doc_filter,
         )
     else:
         chunks = retrieve(
-            query=request.query, db=db, tenant_id=tenant_id,
+            query=request.query, db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
             top_k=request.top_k, doc_filter=request.doc_filter,
         )
         image_caption = None
@@ -260,24 +268,25 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
 
 
 async def _save_turn(
-    thread_id: str, tenant_id: str, is_new_thread: bool,
+    thread_id: str, tenant_id: str, org_unit_id: str, is_new_thread: bool,
     query: str, answer: str, sources: list,
     prompt_tokens: Optional[int] = None,
     completion_tokens: Optional[int] = None,
     image_caption: Optional[str] = None,
 ) -> Optional[str]:
-    save_human_message(thread_id=thread_id, tenant_id=tenant_id, content=query)
+    save_human_message(thread_id=thread_id, tenant_id=tenant_id, org_unit_id=org_unit_id, content=query)
     save_ai_message(
-        thread_id=thread_id, tenant_id=tenant_id, content=answer, sources=sources,
+        thread_id=thread_id, tenant_id=tenant_id, org_unit_id=org_unit_id,
+        content=answer, sources=sources,
         prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
         has_image=image_caption is not None, image_caption=image_caption,
     )
-    increment_message_count(thread_id, tenant_id)
+    increment_message_count(thread_id, tenant_id, org_unit_id)
 
     thread_title = None
     if is_new_thread:
         thread_title = generate_thread_title(query)
-        update_thread_title(thread_id, tenant_id, thread_title)
+        update_thread_title(thread_id, tenant_id, org_unit_id, thread_title)
     return thread_title
 
 
@@ -300,10 +309,11 @@ async def _save_turn(
 async def send_message(
     request: ChatMessageRequest,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     thread_id, is_new_thread, memory, chunks, prompt, image_caption = await _prepare_chat(
-        request, tenant_id, db
+        request, tenant_id, org_unit_id, db
     )
 
     # Fallback when no chunks found
@@ -315,7 +325,7 @@ async def send_message(
             else "I don't have relevant information in the documents to answer your question."
         )
         await _save_turn(
-            thread_id, tenant_id, is_new_thread, request.query, fallback_msg, [],
+            thread_id, tenant_id, org_unit_id, is_new_thread, request.query, fallback_msg, [],
             image_caption=image_caption,
         )
         return ChatMessageResponse(
@@ -347,7 +357,7 @@ async def send_message(
     sources = _build_sources(chunks)
 
     thread_title = await _save_turn(
-        thread_id=thread_id, tenant_id=tenant_id, is_new_thread=is_new_thread,
+        thread_id=thread_id, tenant_id=tenant_id, org_unit_id=org_unit_id, is_new_thread=is_new_thread,
         query=request.query, answer=answer, sources=sources,
         prompt_tokens=result.get("prompt_tokens"),
         completion_tokens=result.get("completion_tokens"),
@@ -368,24 +378,25 @@ async def send_message(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Thread CRUD — all tenant-scoped
+# Thread CRUD — all tenant + org-unit scoped
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/threads", response_model=ThreadResponse, status_code=201, summary="Create a new thread")
 async def create_thread_endpoint(
     request: ThreadCreateRequest,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     thread = create_thread(
-        tenant_id=tenant_id, title=request.title,
+        tenant_id=tenant_id, org_unit_id=org_unit_id, title=request.title,
         user_id=request.user_id, doc_filter=request.doc_filter,
     )
     return ThreadResponse(
         id=thread.id, title=thread.title, user_id=thread.user_id,
         doc_filter=thread.doc_filter, message_count=thread.message_count or 0,
         created_at=thread.created_at, updated_at=thread.updated_at,
-        tenant_id=thread.tenant_id,
+        tenant_id=thread.tenant_id, org_unit_id=thread.org_unit_id,
     )
 
 
@@ -393,16 +404,20 @@ async def create_thread_endpoint(
 async def list_threads(
     page: int = Query(default=1, ge=1), per_page: int = Query(default=20, ge=1, le=100),
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     offset = (page - 1) * per_page
-    base_query = db.query(ChatThread).filter(ChatThread.tenant_id == tenant_id)
+    base_query = db.query(ChatThread).filter(
+        ChatThread.tenant_id == tenant_id,
+        ChatThread.org_unit_id == org_unit_id,
+    )
     total  = base_query.count()
     threads = base_query.order_by(ChatThread.updated_at.desc()).offset(offset).limit(per_page).all()
     return ThreadListResponse(total=total, threads=[
         ThreadResponse(id=t.id, title=t.title, user_id=t.user_id, doc_filter=t.doc_filter,
                        message_count=t.message_count or 0, created_at=t.created_at,
-                       updated_at=t.updated_at, tenant_id=t.tenant_id)
+                       updated_at=t.updated_at, tenant_id=t.tenant_id, org_unit_id=t.org_unit_id)
         for t in threads
     ])
 
@@ -411,27 +426,31 @@ async def list_threads(
 async def get_thread_endpoint(
     thread_id: uuid.UUID,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     thread = db.query(ChatThread).filter(
         ChatThread.id == thread_id, ChatThread.tenant_id == tenant_id,
+        ChatThread.org_unit_id == org_unit_id,
     ).first()
     if not thread:
         raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
     return ThreadResponse(id=thread.id, title=thread.title, user_id=thread.user_id,
                           doc_filter=thread.doc_filter, message_count=thread.message_count or 0,
                           created_at=thread.created_at, updated_at=thread.updated_at,
-                          tenant_id=thread.tenant_id)
+                          tenant_id=thread.tenant_id, org_unit_id=thread.org_unit_id)
 
 
 @router.patch("/threads/{thread_id}", response_model=ThreadResponse, summary="Update thread title")
 async def update_thread_endpoint(
     thread_id: uuid.UUID, request: ThreadUpdateRequest,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     thread = db.query(ChatThread).filter(
         ChatThread.id == thread_id, ChatThread.tenant_id == tenant_id,
+        ChatThread.org_unit_id == org_unit_id,
     ).first()
     if not thread:
         raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
@@ -441,17 +460,19 @@ async def update_thread_endpoint(
     return ThreadResponse(id=thread.id, title=thread.title, user_id=thread.user_id,
                           doc_filter=thread.doc_filter, message_count=thread.message_count or 0,
                           created_at=thread.created_at, updated_at=thread.updated_at,
-                          tenant_id=thread.tenant_id)
+                          tenant_id=thread.tenant_id, org_unit_id=thread.org_unit_id)
 
 
 @router.delete("/threads/{thread_id}", response_model=DeleteResponse, summary="Delete thread and all its messages")
 async def delete_thread_endpoint(
     thread_id: uuid.UUID,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     thread = db.query(ChatThread).filter(
         ChatThread.id == thread_id, ChatThread.tenant_id == tenant_id,
+        ChatThread.org_unit_id == org_unit_id,
     ).first()
     if not thread:
         raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
@@ -465,16 +486,22 @@ async def delete_thread_endpoint(
 async def get_messages_endpoint(
     thread_id: uuid.UUID,
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     thread = db.query(ChatThread).filter(
         ChatThread.id == thread_id, ChatThread.tenant_id == tenant_id,
+        ChatThread.org_unit_id == org_unit_id,
     ).first()
     if not thread:
         raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found")
     messages = (
         db.query(ChatMessage)
-        .filter(ChatMessage.thread_id == thread_id, ChatMessage.tenant_id == tenant_id)
+        .filter(
+            ChatMessage.thread_id == thread_id,
+            ChatMessage.tenant_id == tenant_id,
+            ChatMessage.org_unit_id == org_unit_id,
+        )
         .order_by(ChatMessage.created_at.asc()).all()
     )
     return {
@@ -491,6 +518,7 @@ async def get_messages_endpoint(
 async def search_chat_history(
     query: str = Query(..., min_length=1), top_k: int = Query(default=5, ge=1, le=20),
     tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
 ):
     query_vector = embed_query(query)
@@ -504,10 +532,11 @@ async def search_chat_history(
                 JOIN chat_threads t ON m.thread_id = t.id
                 WHERE m.embedding IS NOT NULL
                   AND m.tenant_id = :tenant_id
+                  AND m.org_unit_id = :org_unit_id
                 ORDER BY m.embedding <=> CAST(:vector AS vector)
                 LIMIT :top_k
             """),
-            {"vector": str(query_vector), "top_k": top_k, "tenant_id": tenant_id}
+            {"vector": str(query_vector), "top_k": top_k, "tenant_id": tenant_id, "org_unit_id": org_unit_id}
         ).fetchall()
         return {
             "query": query, "total": len(results),

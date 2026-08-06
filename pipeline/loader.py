@@ -132,6 +132,7 @@ def extract_images_from_pdf(
     doc_hash:   str,
     doc_name:   str,
     tenant_id:  str,
+    org_unit_id: str,
     source_path: str = "",
 ) -> list[ImageEmbeddingInput]:
     """
@@ -141,9 +142,10 @@ def extract_images_from_pdf(
     Uses pdfplumber for page-level image extraction.
     Surrounding context = text on the same page near the image.
 
-    tenant_id scopes the early dedup check (check_image_hash_exists) so a
-    letterhead/watermark image shared across another tenant's documents
-    doesn't cause this tenant's copy to be silently skipped.
+    tenant_id + org_unit_id together scope the early dedup check
+    (check_image_hash_exists) so a letterhead/watermark image shared
+    across another tenant's or another department's documents doesn't
+    cause this one's copy to be silently skipped.
 
     Returns empty list if PDF has no images or pdfplumber fails.
     """
@@ -201,7 +203,7 @@ def extract_images_from_pdf(
                         # repeated letterhead/watermark across pages)
                         img_hash = compute_image_hash(image_bytes)
                         try:
-                            if check_image_hash_exists(img_hash, tenant_id):
+                            if check_image_hash_exists(img_hash, tenant_id, org_unit_id):
                                 logger.debug(
                                     "Skipping already-embedded PDF image on page %d (hash=%s)",
                                     page_num, img_hash[:12],
