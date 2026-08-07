@@ -10,7 +10,7 @@ Window = last N turns only (not entire history) to avoid token overflow.
 """
 from typing import Optional
 from sqlalchemy.orm import Session
-from langchain_classic.memory import ConversationBufferWindowMemory
+from langchain.memory import ConversationBufferWindowMemory
 from langchain_core.messages import HumanMessage, AIMessage
 
 from db.models import ChatMessage

@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors import LLMChainExtractor
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
 from langchain_core.documents import Document
 
 from config.settings import get_settings

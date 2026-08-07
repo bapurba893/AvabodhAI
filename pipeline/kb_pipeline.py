@@ -9,12 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_experimental.text_splitter import SemanticChunker
-from langchain_postgres import PGEngine, PGVectorStore
-from langchain_classic.retrievers.document_compressors import LLMChainExtractor
-from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_classic.memory import ConversationBufferWindowMemory
+from langchain_postgres.v2.engine import PGEngine
+from langchain_postgres.v2.vectorstores import PGVectorStore
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.memory import ConversationBufferWindowMemory
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 from config.settings import get_settings
@@ -53,7 +53,11 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
 
         # Setup PGEngine and PGVectorStore
         engine = PGEngine.from_connection_string(settings.async_db_url)
-        await engine.ainit_vectorstore_table(table_name="kb_vectors", vector_size=1536)
+        try:
+            await engine.ainit_vectorstore_table(table_name="kb_vectors", vector_size=1536)
+        except Exception:
+            # Table already exists on subsequent runs — safe to continue
+            pass
 
         vector_store = await PGVectorStore.create(
             engine=engine,
