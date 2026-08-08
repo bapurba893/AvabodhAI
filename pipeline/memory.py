@@ -10,8 +10,6 @@ Window = last N turns only (not entire history) to avoid token overflow.
 """
 from typing import Optional
 from sqlalchemy.orm import Session
-from langchain.memory import ConversationBufferWindowMemory
-from langchain_core.messages import HumanMessage, AIMessage
 
 from db.models import ChatMessage
 from config.settings import get_settings
@@ -23,6 +21,34 @@ settings = get_settings()
 # How many past turns to include in context
 # 1 turn = 1 human + 1 AI message
 MEMORY_WINDOW_SIZE = 5
+
+
+class ConversationBufferWindowMemory:
+    """Lightweight compatibility wrapper for conversation history."""
+
+    def __init__(self, k: int = 5, return_messages: bool = True, memory_key: str = "chat_history", input_key: str = "query", output_key: str = "answer") -> None:
+        self.k = k
+        self.return_messages = return_messages
+        self.memory_key = memory_key
+        self.input_key = input_key
+        self.output_key = output_key
+        self.chat_memory = type("ChatMemory", (), {"messages": []})()
+
+    def save_context(self, inputs: dict, outputs: dict) -> None:
+        self.chat_memory.messages.append({"type": "human", "content": inputs.get(self.input_key, "")})
+        self.chat_memory.messages.append({"type": "ai", "content": outputs.get(self.output_key, "")})
+
+    def load_memory_variables(self, _inputs: dict) -> dict:
+        return {self.memory_key: self.format_messages()}
+
+    def format_messages(self) -> str:
+        if not self.chat_memory.messages:
+            return ""
+        parts = []
+        for msg in self.chat_memory.messages[-(self.k * 2):]:
+            role = "Human" if msg["type"] == "human" else "Assistant"
+            parts.append(f"{role}: {msg['content']}")
+        return "\n".join(parts)
 
 
 def load_memory_from_db(thread_id: str, db: Session) -> ConversationBufferWindowMemory:
@@ -112,15 +138,14 @@ Keep answers concise but complete."""
         context_str = "No relevant document context found."
 
     # Conversation history from memory
-    history_messages = memory.chat_memory.messages
+    history_messages = getattr(memory.chat_memory, "messages", [])
     history_str = ""
     if history_messages:
         history_parts = []
         for msg in history_messages:
-            if isinstance(msg, HumanMessage):
-                history_parts.append(f"Human: {msg.content}")
-            elif isinstance(msg, AIMessage):
-                history_parts.append(f"Assistant: {msg.content}")
+            if isinstance(msg, dict):
+                role = "Human" if msg.get("type") == "human" else "Assistant"
+                history_parts.append(f"{role}: {msg.get('content', '')}")
         history_str = "\n".join(history_parts)
 
     # Build full prompt

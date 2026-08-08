@@ -11,11 +11,33 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_postgres.v2.engine import PGEngine
 from langchain_postgres.v2.vectorstores import PGVectorStore
-from langchain.retrievers.document_compressors import LLMChainExtractor
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.memory import ConversationBufferWindowMemory
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+
+class ConversationBufferWindowMemory:
+    """Lightweight compatibility wrapper for chat history in KB flows."""
+
+    def __init__(self, k: int = 5, memory_key: str = "chat_history", return_messages: bool = False) -> None:
+        self.k = k
+        self.memory_key = memory_key
+        self.return_messages = return_messages
+        self.chat_memory = type("ChatMemory", (), {"messages": []})()
+
+    def add_user_message(self, message: str) -> None:
+        self.chat_memory.messages.append({"type": "human", "content": message})
+
+    def add_ai_message(self, message: str) -> None:
+        self.chat_memory.messages.append({"type": "ai", "content": message})
+
+    def load_memory_variables(self, _inputs: dict) -> dict:
+        messages = self.chat_memory.messages[-(self.k * 2):]
+        if self.return_messages:
+            return {self.memory_key: messages}
+        return {self.memory_key: "\n".join(
+            f"Human: {msg['content']}" if msg["type"] == "human" else f"Assistant: {msg['content']}"
+            for msg in messages
+        )}
 
 from config.settings import get_settings
 from db.models import KBDocument, KBChatHistory
@@ -91,7 +113,7 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
         raise
 
 
-def get_compression_retriever(owner_id: str) -> ContextualCompressionRetriever:
+def get_compression_retriever(owner_id: str):
     """
     Builds the ContextualCompressionRetriever with tenant isolation.
     """

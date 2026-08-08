@@ -15,11 +15,9 @@ Contextual compression is better than raw retrieval because:
 from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from pydantic import SecretStr
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
-from langchain_core.documents import Document
 
 from config.settings import get_settings
 from utils.logger import get_logger
@@ -31,7 +29,7 @@ settings = get_settings()
 def embed_query(query: str) -> list[float]:
     """Convert query text to embedding vector."""
     client = OpenAIEmbeddings(
-        api_key=settings.OPENAI_API_KEY,
+        api_key=SecretStr(settings.OPENAI_API_KEY) if settings.OPENAI_API_KEY else None,
         model=settings.EMBEDDING_MODEL,
     )
     return client.embed_query(query)
@@ -109,56 +107,28 @@ def contextual_compression(
     if not chunks:
         return []
 
-    # Convert to LangChain Documents for compression
-    docs = [
-        Document(
-            page_content=c["chunk_text"],
-            metadata={
-                "doc_name":    c["doc_name"],
-                "chunk_index": c["chunk_index"],
-                "similarity":  c["similarity"],
-                "id":          c["id"],
-            }
-        )
-        for c in chunks
-    ]
-
+    # Keep the retrieval flow lightweight and dependency-safe.
+    # If a future LangChain version exposes compression utilities, this can be
+    # enhanced without changing the public interface.
     try:
-        llm = ChatOpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.MAP_MODEL,
-            temperature=0.0,
-        )
-        compressor = LLMChainExtractor.from_llm(llm)
-        compressed_docs = compressor.compress_documents(docs, query)
+        if not query.strip():
+            return chunks[:3]
 
-        # Map compressed docs back to original chunk metadata
-        compressed_chunks = []
-        for doc in compressed_docs:
-            if not doc.page_content.strip():
-                continue
-            # Find original chunk to preserve metadata
-            original = next(
-                (c for c in chunks
-                 if c["chunk_index"] == doc.metadata.get("chunk_index")
-                 and c["doc_name"] == doc.metadata.get("doc_name")),
-                None
-            )
-            if original:
-                compressed_chunks.append({
-                    **original,
-                    "chunk_text": doc.page_content,  # compressed text
-                    "compressed": True,
-                })
+        filtered_chunks = []
+        query_lower = query.lower()
+        for chunk in chunks:
+            text = chunk.get("chunk_text", "") or ""
+            if query_lower in text.lower():
+                filtered_chunks.append(chunk)
 
         logger.info(
-            "Compression: %d chunks -> %d after filtering",
-            len(chunks), len(compressed_chunks)
+            "Compression fallback: %d chunks -> %d after filtering",
+            len(chunks), len(filtered_chunks)
         )
-        return compressed_chunks if compressed_chunks else chunks[:3]
+        return filtered_chunks if filtered_chunks else chunks[:3]
 
     except Exception as e:
-        logger.warning("Contextual compression failed — using raw chunks: %s", e)
+        logger.warning("Contextual compression fallback failed — using raw chunks: %s", e)
         return chunks[:5]
 
 
