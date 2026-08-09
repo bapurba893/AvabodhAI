@@ -23,6 +23,7 @@ services:
     container_name: avabodh_api
     restart: on-failure
     ports:
+      - "4000:8000"
       - "8000:8000"
     environment:
       OPENAI_API_KEY:       ${OPENAI_API_KEY}
