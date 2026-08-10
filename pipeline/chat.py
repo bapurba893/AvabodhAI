@@ -26,6 +26,15 @@ settings = get_settings()
 
 
 def _build_llm(streaming: bool = False) -> ChatOpenAI:
+    if settings.use_ollama:
+        return ChatOpenAI(
+            api_key="ollama",
+            base_url=f"{settings.OLLAMA_BASE_URL.rstrip('/')}/v1",
+            model=settings.OLLAMA_CHAT_MODEL,
+            temperature=0.3,
+            max_tokens=1024,
+            streaming=streaming,
+        )
     return ChatOpenAI(
         api_key=settings.OPENAI_API_KEY,
         model=settings.MAP_MODEL,

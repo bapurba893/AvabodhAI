@@ -119,6 +119,14 @@ SECTION SUMMARIES:
 
 
 def _build_llm(max_tokens: int) -> ChatOpenAI:
+    if settings.use_ollama:
+        return ChatOpenAI(
+            api_key="ollama",
+            base_url=f"{settings.OLLAMA_BASE_URL.rstrip('/')}/v1",
+            model=settings.OLLAMA_CHAT_MODEL,
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=max_tokens,
+        )
     return ChatOpenAI(
         api_key=settings.OPENAI_API_KEY,
         model=settings.MAP_MODEL,

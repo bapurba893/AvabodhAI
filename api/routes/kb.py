@@ -1,6 +1,7 @@
 import os
 import uuid
 import logging
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
@@ -46,15 +47,22 @@ async def bg_ingestion_wrapper(file_path: str, owner_id: str, document_id: str):
 
 
 @router.post(
-    "/upload",
+    "/documents",
     response_model=KBUploadResponse,
     status_code=202,
     summary="Upload document to Knowledge Base"
+)
+@router.post(
+    "/upload",
+    response_model=KBUploadResponse,
+    status_code=202,
+    include_in_schema=False,
 )
 async def upload_kb_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     owner_id: str = Form(...),
+    category: Optional[str] = Form(None),
     metadata: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_async_db_session_fastapi)
 ):
@@ -62,7 +70,9 @@ async def upload_kb_document(
     doc_id = uuid.uuid4()
 
     # 2. Save file temporarily
-    temp_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{file.filename}")
+    # Never trust a client-provided filename as a path component.
+    safe_filename = Path(file.filename or "upload").name
+    temp_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{safe_filename}")
     try:
         with open(temp_path, "wb") as f:
             f.write(await file.read())
@@ -74,7 +84,7 @@ async def upload_kb_document(
     kb_doc = KBDocument(
         id=doc_id,
         owner_id=owner_id,
-        file_name=file.filename,
+        file_name=safe_filename,
         status="processing",
         created_at=datetime.now(timezone.utc)
     )

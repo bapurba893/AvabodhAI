@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
 
+    # Provider selection.  "auto" keeps OpenAI for production when a key is
+    # supplied and switches to the local Ollama server for developer/demo use.
+    LLM_PROVIDER: str = "auto"       # auto | openai | ollama
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_CHAT_MODEL: str = "qwen2.5:1.5b"
+    OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text"
+    OLLAMA_EMBEDDING_DIMENSIONS: int = 768
+
     MAP_MAX_TOKENS: int = 512
     REDUCE_MAX_TOKENS: int = 1024
     LLM_TEMPERATURE: float = 0.0
@@ -73,6 +81,10 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
+        # A shared local .env can also contain UI/backend variables such as
+        # PYTHON_KB_INTERNAL_URL; they are not API settings and must not block
+        # service startup.
+        extra="ignore",
     )
 
     @property
@@ -88,6 +100,14 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
         )
+
+    @property
+    def use_ollama(self) -> bool:
+        """Use local Ollama when explicitly requested or no OpenAI key exists."""
+        provider = self.LLM_PROVIDER.strip().lower()
+        if provider not in {"auto", "openai", "ollama"}:
+            raise ValueError("LLM_PROVIDER must be one of: auto, openai, ollama")
+        return provider == "ollama" or (provider == "auto" and not self.OPENAI_API_KEY)
 
 
 @lru_cache

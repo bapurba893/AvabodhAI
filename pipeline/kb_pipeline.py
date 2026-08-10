@@ -8,6 +8,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+try:
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+except ImportError:  # Raised with a clear message only if local mode is used.
+    ChatOllama = None
+    OllamaEmbeddings = None
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_postgres.v2.engine import PGEngine
 from langchain_postgres.v2.vectorstores import PGVectorStore
@@ -47,6 +52,35 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def _embeddings_client():
+    """Return OpenAI embeddings in production or a local Ollama client in demo mode."""
+    if settings.use_ollama:
+        if OllamaEmbeddings is None:
+            raise RuntimeError("Ollama mode requires langchain-ollama. Install requirements.txt.")
+        return OllamaEmbeddings(
+            model=settings.OLLAMA_EMBEDDING_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
+        )
+    return OpenAIEmbeddings(model=settings.EMBEDDING_MODEL, api_key=settings.OPENAI_API_KEY)
+
+
+def _chat_model(temperature: float = 0.0):
+    """Select Ollama automatically when OPENAI_API_KEY is absent."""
+    if settings.use_ollama:
+        if ChatOllama is None:
+            raise RuntimeError("Ollama mode requires langchain-ollama. Install requirements.txt.")
+        return ChatOllama(
+            model=settings.OLLAMA_CHAT_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
+            temperature=temperature,
+        )
+    return ChatOpenAI(model=settings.MAP_MODEL, temperature=temperature, api_key=settings.OPENAI_API_KEY)
+
+
+def _vector_size() -> int:
+    return settings.OLLAMA_EMBEDDING_DIMENSIONS if settings.use_ollama else settings.EMBEDDING_DIMENSIONS
+
+
 async def ingest_document(file_path: str, owner_id: str, document_id: str, db: AsyncSession) -> None:
     """
     Ingests an uploaded document into the PGVector store.
@@ -59,10 +93,7 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
             raise ValueError("No text extracted from document.")
 
         # Initialize embeddings & chunker
-        embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            openai_api_key=settings.OPENAI_API_KEY
-        )
+        embeddings = _embeddings_client()
         text_splitter = SemanticChunker(embeddings)
 
         # Split documents
@@ -76,7 +107,7 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
         # Setup PGEngine and PGVectorStore
         engine = PGEngine.from_connection_string(settings.async_db_url)
         try:
-            await engine.ainit_vectorstore_table(table_name="kb_vectors", vector_size=1536)
+            await engine.ainit_vectorstore_table(table_name="kb_vectors", vector_size=_vector_size())
         except Exception:
             # Table already exists on subsequent runs — safe to continue
             pass
@@ -117,10 +148,7 @@ def get_compression_retriever(owner_id: str):
     """
     Builds the ContextualCompressionRetriever with tenant isolation.
     """
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=settings.OPENAI_API_KEY
-    )
+    embeddings = _embeddings_client()
     engine = PGEngine.from_connection_string(settings.async_db_url)
     
     # Initialize base retriever
@@ -134,19 +162,16 @@ def get_compression_retriever(owner_id: str):
         search_kwargs={"filter": {"owner_id": owner_id}}
     )
     
-    # Initialize LLM extractor
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.0,
-        openai_api_key=settings.OPENAI_API_KEY
-    )
-    compressor = LLMChainExtractor.from_llm(llm)
-    
-    # Combine
-    return ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=base_retriever
-    )
+    # Avoid a second model call merely to compress retrieved chunks.  This
+    # keeps the endpoint provider-neutral and works with local Ollama.
+    return base_retriever
+
+
+async def _retrieve_documents(retriever, query: str):
+    """Support both modern LangChain retrievers and older compatibility APIs."""
+    if hasattr(retriever, "aget_relevant_documents"):
+        return await retriever.aget_relevant_documents(query)
+    return await retriever.ainvoke(query)
 
 
 async def retrieve_relevant_context(owner_id: str, query: str) -> List[str]:
@@ -154,19 +179,21 @@ async def retrieve_relevant_context(owner_id: str, query: str) -> List[str]:
     Retrieves compressed relevant context chunks for a query.
     """
     retriever = get_compression_retriever(owner_id)
-    docs = await retriever.aget_relevant_documents(query)
+    docs = await _retrieve_documents(retriever, query)
     return [doc.page_content for doc in docs]
 
 
 async def chat_with_kb(
     owner_id: str,
     message: str,
-    conversation_id: str,
+    conversation_id: str | None,
     db: AsyncSession
 ) -> str:
     """
     Executes the conversational retrieval pipeline with history.
     """
+    conversation_id = conversation_id or str(uuid.uuid4())
+
     # 1. Fetch last 5 turns (10 messages) of chat history, scoped to owner
     stmt = (
         select(KBChatHistory)
@@ -197,11 +224,7 @@ async def chat_with_kb(
     retriever = get_compression_retriever(owner_id)
 
     # 4. Setup LLM & custom chain
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.0,
-        openai_api_key=settings.OPENAI_API_KEY
-    )
+    llm = _chat_model(temperature=0.0)
 
     template = """You are a helpful assistant. Use the following context and chat history to answer the user's question. If you don't know the answer, say you don't know.
 
@@ -220,7 +243,7 @@ Answer:"""
     )
 
     # Load context and run LCEL chain
-    retrieved_docs = await retriever.aget_relevant_documents(message)
+    retrieved_docs = await _retrieve_documents(retriever, message)
     context = "\n\n".join(doc.page_content for doc in retrieved_docs)
     chat_history_str = memory.load_memory_variables({})["chat_history"]
 

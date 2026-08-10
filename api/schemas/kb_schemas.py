@@ -27,7 +27,7 @@ class KBRetrieveRequest(BaseModel):
 class KBChatRequest(BaseModel):
     owner_id: str
     message: str
-    conversation_id: str
+    conversation_id: Optional[str] = None
 
 
 class KBChatResponse(BaseModel):
