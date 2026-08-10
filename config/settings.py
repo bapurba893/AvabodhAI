@@ -7,6 +7,7 @@ Never hardcode secrets — use .env file locally, secrets manager in production.
 
 import os
 from functools import lru_cache
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -96,7 +97,23 @@ class Settings(BaseSettings):
     # production — the default below is fine for local dev only, and is
     # deliberately obviously-not-secret so nobody mistakes it for a real one.
     SECRET_KEY: str = "dev-only-CHANGE-ME-in-production"
-    FILE_LINK_TTL_SECONDS: int = 900       # 15 minutes
+    # Product decision (lead architect, confirmed): preview links do NOT
+    # expire — None means generate_file_token() embeds no expiry at all.
+    # Set this to a number of seconds if that decision ever changes; the
+    # mechanism to re-enable expiry is still fully in place, just unused
+    # by default. See utils/signed_link.py verify_file_token() for the
+    # security tradeoff this represents.
+    FILE_LINK_TTL_SECONDS: Optional[int] = None
+
+    # ── Public base URL for preview_link ────────────────────────────────────
+    # Empty by default — the API auto-detects the correct host from the
+    # incoming request (request.base_url), which is correct for direct
+    # local/dev access. Set this explicitly once the API sits behind the
+    # Security Gateway or any reverse proxy: auto-detection would then see
+    # the internal request (e.g. http://avabodh_api:8000/), not the public
+    # address an end user's browser can actually reach — set this to the
+    # real public URL (e.g. https://api.clariona.com) to override it.
+    PUBLIC_BASE_URL: str = ""
 
 
     # ── Logging ────────────────────────────────────────────────────────────

@@ -51,16 +51,24 @@ def generate_file_token(
 ) -> str:
     """
     Generate a signed token encoding which document, which tenant, which
-    org unit this link is allowed to serve, and when it expires.
-    Format: <base64-payload>.<base64-signature>
+    org unit this link is allowed to serve.
+
+    ttl_seconds: if given, the token expires after that many seconds
+    (checked by verify_file_token). If omitted (the default, per
+    settings.FILE_LINK_TTL_SECONDS being None), NO expiry is embedded at
+    all — the link is valid indefinitely, as long as the signature and
+    doc_id still match. This is a deliberate choice, not an oversight —
+    see verify_file_token()'s docstring for the tradeoff this represents.
     """
     ttl = ttl_seconds if ttl_seconds is not None else settings.FILE_LINK_TTL_SECONDS
     payload = {
         "doc_id": doc_id,
         "tenant_id": tenant_id,
         "org_unit_id": org_unit_id,
-        "exp": int(time.time()) + ttl,
     }
+    if ttl is not None:
+        payload["exp"] = int(time.time()) + ttl
+
     payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     payload_b64 = _b64encode(payload_bytes)
 
@@ -72,10 +80,22 @@ def generate_file_token(
 
 def verify_file_token(token: str) -> Optional[dict]:
     """
-    Verify a token's signature and expiry. Returns the decoded payload
-    dict (doc_id/tenant_id/org_unit_id/exp) if valid, None if the token
-    is malformed, tampered with, or expired. Never raises — callers
-    should treat None as "reject with 403/404", not as an error to debug.
+    Verify a token's signature (and expiry, if the token has one).
+    Returns the decoded payload dict if valid, None if the token is
+    malformed, tampered with, or expired. Never raises — callers should
+    treat None as "reject with 403/404", not as an error to debug.
+
+    Per explicit product decision (lead architect direction, confirmed
+    with the team): preview links do NOT expire by default —
+    settings.FILE_LINK_TTL_SECONDS is None, so generate_file_token()
+    embeds no "exp" field, and there's nothing here to check against.
+    The tradeoff, worth keeping in mind even though the decision is
+    made: a link generated once remains valid forever — anyone who
+    obtains a copy of it (not just the person it was originally shown
+    to) can open the document at any point in the future, indefinitely.
+    Signature verification below still guarantees the link can't be
+    forged or altered (wrong doc_id, wrong tenant, etc.) — what's
+    removed is only the time limit, not the authenticity check.
     """
     try:
         payload_b64, sig_b64 = token.split(".", 1)
@@ -94,7 +114,12 @@ def verify_file_token(token: str) -> Optional[dict]:
     except Exception:
         return None
 
-    if not isinstance(payload, dict) or payload.get("exp", 0) < time.time():
+    if not isinstance(payload, dict):
+        return None
+
+    # Only enforced if the token actually carries an "exp" — tokens
+    # generated with no ttl (the current default) simply don't have one.
+    if "exp" in payload and payload["exp"] < time.time():
         return None
 
     return payload

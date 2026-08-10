@@ -59,7 +59,11 @@ services:
       # real value here (or in .env) before any production deployment, or the
       # API logs a loud warning on startup and preview links stay forgeable.
       SECRET_KEY:            ${SECRET_KEY:-dev-only-CHANGE-ME-in-production}
-      FILE_LINK_TTL_SECONDS: ${FILE_LINK_TTL_SECONDS:-900}
+      # FILE_LINK_TTL_SECONDS deliberately NOT set here — preview links
+      # don't expire by default (see config/settings.py). If a TTL is
+      # ever needed again, add FILE_LINK_TTL_SECONDS=<seconds> to .env
+      # AND add the line back here — don't set it to an empty value,
+      # pydantic-settings will fail trying to parse "" as int.
       LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
       LANGCHAIN_ENDPOINT:   ${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
       LANGCHAIN_API_KEY:    ${LANGCHAIN_API_KEY}

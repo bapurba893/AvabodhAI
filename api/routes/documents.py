@@ -13,7 +13,7 @@ attached.
 Preview: no separate preview endpoint — GET /documents/{id} already
 returns everything a preview needs (summary, title, category,
 org_unit_id, tenant_id, effective dates, ground-truth flag) plus a
-`preview_link` field. That link points at a signed, short-lived URL
+`preview_link` field. That link points at a signed URL (no expiry by default — see utils/signed_link.py)
 (GET /documents/{id}/file) since a plain clickable link/iframe can't
 carry our auth headers — see utils/signed_link.py.
 """
@@ -24,7 +24,7 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query, Form
+from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query, Form, Request
 from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -76,11 +76,27 @@ def _to_utc_datetime(d: Optional[date]) -> Optional[datetime]:
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
 
-def _build_preview_link(record: DocumentSummary, tenant_id: str, org_unit_id: str) -> Optional[str]:
+def _build_preview_link(record: DocumentSummary, tenant_id: str, org_unit_id: str, request: Request) -> Optional[str]:
     """
     Web-scraped documents: source_path IS the original URL — just return it.
-    Uploaded documents: build a signed, short-lived link to our own
+    Uploaded documents: build a signed link (no expiry by default) to our own
     file-serving endpoint, since a plain link can't carry auth headers.
+
+    Returns a FULL absolute URL (scheme + host + path), not a bare
+    relative path like "/documents/{id}/file?token=..." — a relative
+    path only resolves correctly if opened from a page already on this
+    API's own origin. Pasted directly into a browser, or rendered from
+    a separate frontend origin (Clariona, through the gateway), a
+    relative path has nothing to resolve against and fails outright
+    (this is exactly what produced DNS_PROBE_FINISHED_NXDOMAIN when
+    tested directly — the browser tried to look up "documents" itself
+    as a hostname).
+
+    Host is auto-detected from the incoming request by default (correct
+    for direct local access) — set settings.PUBLIC_BASE_URL to override
+    this once the API sits behind a reverse proxy/gateway, where the
+    auto-detected host would be the internal address, not the public
+    one an end user's browser can actually reach.
     """
     if not record.source_path:
         return None
@@ -89,7 +105,8 @@ def _build_preview_link(record: DocumentSummary, tenant_id: str, org_unit_id: st
     if not os.path.exists(record.source_path):
         return None
     token = generate_file_token(str(record.id), tenant_id, org_unit_id)
-    return f"/documents/{record.id}/file?token={token}"
+    base = settings.PUBLIC_BASE_URL.rstrip("/") if settings.PUBLIC_BASE_URL else str(request.base_url).rstrip("/")
+    return f"{base}/documents/{record.id}/file?token={token}"
 
 
 @router.post(
@@ -99,6 +116,7 @@ def _build_preview_link(record: DocumentSummary, tenant_id: str, org_unit_id: st
     summary="Upload a document and generate summary",
 )
 async def upload_document(
+    request: Request,
     file: UploadFile = File(..., description="PDF, TXT, DOCX, or CSV file"),
     category: Optional[str] = Form(default=None, description="Client-defined category, e.g. 'Policy', 'Guide'"),
     effective_from: Optional[date] = Form(default=None, description="Validity window start — metadata only, no retrieval effect"),
@@ -171,7 +189,7 @@ async def upload_document(
                     "key_entities": existing.key_entities,
                     "metadata_status": existing.metadata_status,
                     "image_count":  existing.image_count or 0,
-                    "preview_link": _build_preview_link(existing, tenant_id, org_unit_id),
+                    "preview_link": _build_preview_link(existing, tenant_id, org_unit_id, request),
                     "created_at":   str(existing.created_at),
                     "updated_at":   str(existing.updated_at) if existing.updated_at else None,
                     "elapsed_sec":  0.0,
@@ -295,7 +313,7 @@ async def upload_document(
         confidentiality_level = record.confidentiality_level,
         metadata_status = record.metadata_status,
         image_count     = record.image_count or 0,
-        preview_link    = _build_preview_link(record, tenant_id, org_unit_id),
+        preview_link    = _build_preview_link(record, tenant_id, org_unit_id, request),
         created_at  = record.created_at,
         updated_at  = record.updated_at,
         elapsed_sec = raw_result.get("elapsed_sec"),
@@ -354,6 +372,7 @@ async def list_documents(
 @router.get("/{doc_id}", response_model=DocumentDetailResponse, summary="Get full summary by ID (includes preview data)")
 async def get_document(
     doc_id: uuid.UUID,
+    request: Request,
     tenant_id: str = Depends(get_tenant_id),
     org_unit_id: str = Depends(get_org_unit_id),
     db: Session = Depends(get_db_session_fastapi),
@@ -388,9 +407,51 @@ async def get_document(
         confidentiality_level=record.confidentiality_level,
         metadata_status=record.metadata_status,
         image_count=record.image_count or 0,
-        preview_link=_build_preview_link(record, tenant_id, org_unit_id),
+        preview_link=_build_preview_link(record, tenant_id, org_unit_id, request),
         created_at=record.created_at, updated_at=record.updated_at,
     )
+
+
+@router.get("/{doc_id}/preview-url", summary="Get a fresh preview link for a document")
+async def get_document_preview_url(
+    doc_id: uuid.UUID,
+    request: Request,
+    tenant_id: str = Depends(get_tenant_id),
+    org_unit_id: str = Depends(get_org_unit_id),
+    db: Session = Depends(get_db_session_fastapi),
+):
+    """
+    Dedicated, lightweight endpoint — returns ONLY a preview link, not
+    the full document payload. This is the endpoint a caller (Clariona's
+    backend, or any other consumer) should call EVERY TIME a user wants
+    to view a document — not just once at upload time, and not something
+    to cache/store and reuse later.
+
+    Preview links from this API don't expire (see utils/signed_link.py),
+    so in practice calling this fresh each time versus reusing an old
+    one makes no functional difference right now — but architecturally,
+    always fetching fresh here is still the correct pattern: it's what
+    keeps this working automatically if expiry is ever reintroduced
+    later (see FILE_LINK_TTL_SECONDS), with zero change needed on the
+    calling side.
+    """
+    record = (
+        db.query(DocumentSummary)
+        .filter(
+            DocumentSummary.id == doc_id,
+            DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
+        )
+        .first()
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found")
+
+    preview_link = _build_preview_link(record, tenant_id, org_unit_id, request)
+    if not preview_link:
+        raise HTTPException(status_code=404, detail="No file available for this document")
+
+    return {"doc_id": str(doc_id), "preview_link": preview_link}
 
 
 @router.get("/{doc_id}/file", summary="Stream the original uploaded file (signed link only)")
@@ -404,9 +465,10 @@ async def get_document_file(
     X-Org-Unit-ID headers — this endpoint is meant to be hit as a plain
     clickable link or <iframe src>, and browsers don't attach custom
     headers to those. The token (see utils/signed_link.py) encodes which
-    document, which tenant, which org unit, and an expiry — generated
-    fresh every time GET /documents/{id} is called, valid for
-    settings.FILE_LINK_TTL_SECONDS (15 minutes by default).
+    document, which tenant, which org unit — and, by default, no expiry
+    at all (settings.FILE_LINK_TTL_SECONDS is None), per explicit
+    product decision. Generated fresh every time GET /documents/{id} or
+    GET /documents/{id}/preview-url is called.
     """
     payload = verify_file_token(token)
     if not payload or payload.get("doc_id") != str(doc_id):

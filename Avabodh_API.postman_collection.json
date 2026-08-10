@@ -204,6 +204,39 @@
 					}
 				},
 				{
+					"name": "Get Fresh Preview URL",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/documents/{{doc_id}}/preview-url",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"documents",
+								"{{doc_id}}",
+								"preview-url"
+							]
+						},
+						"description": "Dedicated endpoint \u2014 returns just a fresh preview_link, not the full document payload. Call this every time a user wants to view a document, rather than caching an old link."
+					},
+					"response": []
+				},
+				{
 					"name": "Update Document Name",
 					"request": {
 						"method": "PATCH",

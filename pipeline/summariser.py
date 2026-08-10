@@ -14,6 +14,7 @@ Reduce step: Single LLM call combines all chunk summaries into one,
 """
 
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -67,32 +68,44 @@ SECTION:
 
 COMBINE_PROMPT = PromptTemplate(
     input_variables=["text"],
-    template="""You are a senior document analyst.
-Below are summaries of individual sections of a document.
-Create a structured summary using EXACTLY this format:
+    template="""You are a senior document analyst writing an executive summary for a
+document management system. The system that displays this summary does
+NOT render markdown or preserve line breaks reliably — assume your
+output may be shown as one continuous block of text with no formatting
+applied at all. It must still read as clear, well-punctuated prose in
+that worst case, not a broken list.
 
-DOCUMENT OVERVIEW
-Write 3-4 sentences covering the big picture of the entire document.
-KEY FINDINGS
-- Write each key finding as a bullet point
-- Each bullet should be one clear sentence
-- Include 5-7 most important findings only
-MAIN TOPICS COVERED
-- List each major topic discussed in the document
-- Keep each topic to 3-5 words
-- Include 4-6 topics
-CONCLUSION
-Write one powerful sentence that captures the overall takeaway.
+Write exactly four short paragraphs, in this order, as plain sentences.
+Never use a dash, bullet, asterisk, or hash symbol anywhere — every
+point must be a complete grammatical sentence, connected with ordinary
+words like "First," "Second," "Additionally," and "Finally," never with
+a line break or a symbol standing in for punctuation. Each paragraph
+label below must be followed immediately by its content on the same
+line, never left standing alone.
+
+Overview: 3-4 sentences covering the big picture of the entire document.
+
+Key Findings: 5-7 of the most important findings, each as one complete
+sentence, joined naturally in a flowing paragraph (for example: "First,
+... Second, ... Additionally, ... Finally, ...").
+
+Main Topics: one sentence naming the 4-6 major topics discussed,
+separated by commas, written as a normal sentence (for example: "This
+document covers X, Y, and Z.").
+
+Conclusion: one sentence capturing the overall takeaway.
+
 Rules:
-- Use exactly the headings shown above
-- Do not add extra sections
-- Do not write paragraphs under KEY FINDINGS or MAIN TOPICS
-- Be specific, not vague
-- Maximum 400 words total
+- Separate the four paragraphs with a single blank line, nothing else.
+- Never put "Overview", "Key Findings", "Main Topics", or "Conclusion"
+  on their own line — always followed directly by a colon and the
+  sentence content on that same line.
+- Be specific, not vague.
+- Maximum 400 words total.
 SECTION SUMMARIES:
 {text}
 
-STRUCTURED SUMMARY:""",
+EXECUTIVE SUMMARY:""",
 )
 
 # ── NEW — Document-level metadata extraction prompt ────────────────────────────
@@ -253,6 +266,18 @@ def summarise_document(chunks: list[Document], doc_name: str = "document") -> di
 
     try:
         final_summary = reduce_chain.invoke({"text": combined}).strip()
+
+        # Deterministic safety net, not just a prompt instruction — collapse
+        # ANY run of whitespace (newlines, double spaces, tabs) into exactly
+        # one regular space. This is what actually guarantees a visible gap
+        # between "...State House." and "Key Findings:" — a plain space
+        # character survives essentially any frontend's text handling,
+        # where a raw newline is what was silently vanishing before (see
+        # the "KEY FINDINGS-President Tinubu" collision with zero space,
+        # confirmed in testing against Clariona's actual UI). Relying on
+        # the LLM to reliably include spacing on every single generation
+        # isn't a guarantee; this line is.
+        final_summary = re.sub(r"\s+", " ", final_summary).strip()
     except Exception as e:
         logger.error("Reduce step failed: %s", e)
         raise RuntimeError(f"Reduce step failed: {e}")
