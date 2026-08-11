@@ -59,7 +59,7 @@ def _embeddings_client():
             raise RuntimeError("Ollama mode requires langchain-ollama. Install requirements.txt.")
         return OllamaEmbeddings(
             model=settings.OLLAMA_EMBEDDING_MODEL,
-            base_url=settings.OLLAMA_BASE_URL,
+            base_url=settings.ollama_url,
         )
     return OpenAIEmbeddings(model=settings.EMBEDDING_MODEL, api_key=settings.OPENAI_API_KEY)
 
@@ -71,7 +71,7 @@ def _chat_model(temperature: float = 0.0):
             raise RuntimeError("Ollama mode requires langchain-ollama. Install requirements.txt.")
         return ChatOllama(
             model=settings.OLLAMA_CHAT_MODEL,
-            base_url=settings.OLLAMA_BASE_URL,
+            base_url=settings.ollama_url,
             temperature=temperature,
         )
     return ChatOpenAI(model=settings.MAP_MODEL, temperature=temperature, api_key=settings.OPENAI_API_KEY)

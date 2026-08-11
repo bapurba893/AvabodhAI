@@ -26,7 +26,12 @@ services:
       - "4000:8000"
       - "8000:8000"
     environment:
+      LLM_PROVIDER:         ${LLM_PROVIDER:-auto}
       OPENAI_API_KEY:       ${OPENAI_API_KEY}
+      OLLAMA_BASE_URL:      ${OLLAMA_DOCKER_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_CHAT_MODEL:    ${OLLAMA_CHAT_MODEL:-qwen2.5:1.5b}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      OLLAMA_EMBEDDING_DIMENSIONS: ${OLLAMA_EMBEDDING_DIMENSIONS:-768}
       MAP_MODEL:            ${MAP_MODEL:-gpt-4o-mini}
       REDUCE_MODEL:         ${REDUCE_MODEL:-gpt-4o-mini}
       EMBEDDING_MODEL:      ${EMBEDDING_MODEL:-text-embedding-3-small}

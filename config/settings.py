@@ -6,8 +6,24 @@ Never hardcode secrets — use .env file locally, secrets manager in production.
 """
 
 import os
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
+from pathlib import Path
 from functools import lru_cache
+from typing import Any
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _preferred_env_files() -> list[str]:
+    """Prefer a local demo env file when it exists, then fall back to root .env."""
+    candidates: list[Path] = []
+    demo_env = Path("local_demo/.env")
+    if demo_env.exists():
+        candidates.append(demo_env)
+    candidates.append(Path(".env"))
+    return [str(path) for path in candidates if path.exists()]
 
 
 class Settings(BaseSettings):
@@ -32,6 +48,7 @@ class Settings(BaseSettings):
     # supplied and switches to the local Ollama server for developer/demo use.
     LLM_PROVIDER: str = "auto"       # auto | openai | ollama
     OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_DOCKER_BASE_URL: str = "http://host.docker.internal:11434"
     OLLAMA_CHAT_MODEL: str = "qwen2.5:1.5b"
     OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text"
     OLLAMA_EMBEDDING_DIMENSIONS: int = 768
@@ -78,7 +95,7 @@ class Settings(BaseSettings):
     LANGCHAIN_PROJECT: str = "Avabodh Project"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_preferred_env_files() or None,
         env_file_encoding="utf-8",
         case_sensitive=True,
         # A shared local .env can also contain UI/backend variables such as
@@ -86,6 +103,30 @@ class Settings(BaseSettings):
         # service startup.
         extra="ignore",
     )
+
+    @field_validator(
+        "DB_PORT",
+        "DB_POOL_SIZE",
+        "DB_MAX_OVERFLOW",
+        "DB_POOL_TIMEOUT",
+        "EMBEDDING_DIMENSIONS",
+        "EMBEDDING_BATCH_SIZE",
+        "OLLAMA_EMBEDDING_DIMENSIONS",
+        "LLM_REQUEST_TIMEOUT",
+        "LLM_MAX_RETRIES",
+        "MAP_MAX_TOKENS",
+        "REDUCE_MAX_TOKENS",
+        "SUMMARY_MAX_LENGTH",
+        "MAX_CHUNK_SIZE",
+        "MIN_CHUNK_SIZE",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_blank_ints(cls, value: Any, info) -> Any:
+        """Treat empty or whitespace-only env values as unset so defaults apply."""
+        if isinstance(value, str) and not value.strip():
+            return cls.model_fields[info.field_name].default
+        return value
 
     @property
     def db_url(self) -> str:
@@ -108,6 +149,21 @@ class Settings(BaseSettings):
         if provider not in {"auto", "openai", "ollama"}:
             raise ValueError("LLM_PROVIDER must be one of: auto, openai, ollama")
         return provider == "ollama" or (provider == "auto" and not self.OPENAI_API_KEY)
+
+    @property
+    def ollama_url(self) -> str:
+        """Return the first reachable Ollama base URL for the current runtime."""
+        candidates = [self.OLLAMA_BASE_URL, getattr(self, "OLLAMA_DOCKER_BASE_URL", "")]
+        for base_url in candidates:
+            base_url = (base_url or "").strip().rstrip("/")
+            if not base_url:
+                continue
+            try:
+                with urlopen(f"{base_url}/api/version", timeout=2):
+                    return base_url
+            except (URLError, HTTPError, TimeoutError, ValueError):
+                continue
+        return self.OLLAMA_BASE_URL.rstrip("/")
 
 
 @lru_cache
