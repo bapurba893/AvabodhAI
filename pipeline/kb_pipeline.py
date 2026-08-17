@@ -100,10 +100,24 @@ async def ingest_document(file_path: str, owner_id: str, document_id: str, db: A
         # Split documents
         chunks = text_splitter.split_documents(docs)
 
+        source_path = Path(file_path).as_posix()
+        file_name = Path(file_path).name
+        doc_name = next(
+            (
+                str(doc.metadata.get("doc_name"))
+                for doc in docs
+                if doc.metadata.get("doc_name")
+            ),
+            file_name,
+        )
+
         # Inject metadata for tenant isolation
         for chunk in chunks:
             chunk.metadata["owner_id"] = owner_id
             chunk.metadata["document_id"] = document_id
+            chunk.metadata["doc_name"] = doc_name
+            chunk.metadata["file_name"] = file_name
+            chunk.metadata["source_path"] = source_path
 
         # Setup PGEngine and PGVectorStore
         engine = PGEngine.from_connection_string(settings.async_db_url)
@@ -208,6 +222,26 @@ async def _resolve_kb_document_names(
     return {str(doc.id): doc.file_name for doc in result.scalars().all()}
 
 
+def _normalize_source_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize source metadata so the frontend always gets a useful citation object."""
+    source_path = metadata.get("source_path") or metadata.get("source")
+    doc_name = (
+        metadata.get("doc_name")
+        or metadata.get("file_name")
+        or (Path(str(source_path)).name if source_path else None)
+        or "Uploaded document"
+    )
+    document_id = metadata.get("document_id")
+    document_id = str(document_id) if document_id else None
+
+    return {
+        "document_id": document_id,
+        "doc_name": doc_name,
+        "file_name": metadata.get("file_name") or doc_name,
+        "source_path": str(source_path) if source_path else None,
+    }
+
+
 async def _build_kb_sources(
     retrieved_docs,
     owner_id: str,
@@ -220,37 +254,41 @@ async def _build_kb_sources(
     The vector store can return several chunks from the same file; the UI only
     needs a small source list that points users back to each referenced document.
     """
-    document_ids = [
-        str(doc.metadata.get("document_id"))
-        for doc in retrieved_docs
-        if doc.metadata.get("document_id")
-    ]
+    normalized_docs: List[Dict[str, Any]] = []
+    document_ids = []
+    for doc in retrieved_docs:
+        metadata = doc.metadata or {}
+        normalized = _normalize_source_metadata(metadata)
+        normalized_docs.append({
+            "doc": doc,
+            "metadata": metadata,
+            "normalized": normalized,
+        })
+        if normalized["document_id"]:
+            document_ids.append(normalized["document_id"])
+
     resolved_names = await _resolve_kb_document_names(db, owner_id, document_ids)
 
     sources: List[Dict[str, Any]] = []
     seen_keys: set[str] = set()
-    for index, doc in enumerate(retrieved_docs):
-        metadata = doc.metadata or {}
-        document_id = str(metadata.get("document_id") or "")
-        source_path = metadata.get("source_path") or metadata.get("source")
-        fallback_name = (
-            metadata.get("doc_name")
-            or metadata.get("file_name")
-            or (Path(str(source_path)).name if source_path else None)
-            or "Uploaded document"
-        )
-        doc_name = resolved_names.get(document_id, str(fallback_name))
-        key = document_id or doc_name
+    for index, item in enumerate(normalized_docs):
+        metadata = item["metadata"]
+        normalized = item["normalized"]
+        document_id = normalized["document_id"]
+        source_path = normalized["source_path"]
+        doc_name = resolved_names.get(document_id, normalized["doc_name"]) if document_id else normalized["doc_name"]
+        key = document_id or source_path or doc_name
         if key in seen_keys:
             continue
         seen_keys.add(key)
 
         sources.append({
-            "document_id": document_id or None,
+            "document_id": document_id,
             "doc_name": doc_name,
+            "file_name": normalized["file_name"],
             "chunk_index": metadata.get("chunk_index", index),
             "chunk_text": " ".join(doc.page_content.split())[:240],
-            "source_path": str(source_path) if source_path else None,
+            "source_path": source_path,
         })
         if len(sources) >= limit:
             break

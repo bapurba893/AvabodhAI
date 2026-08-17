@@ -33,6 +33,8 @@ class KBChatRequest(BaseModel):
 class KBSourceReference(BaseModel):
     document_id: Optional[str] = None
     doc_name: str
+    file_name: Optional[str] = None
+    title: Optional[str] = None
     chunk_index: Optional[int] = None
     chunk_text: Optional[str] = None
     source_path: Optional[str] = None
