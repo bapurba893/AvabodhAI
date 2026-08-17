@@ -1,6 +1,7 @@
 import os
 import uuid
 import logging
+from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime, timezone
 
@@ -183,12 +184,86 @@ async def retrieve_relevant_context(owner_id: str, query: str) -> List[str]:
     return [doc.page_content for doc in docs]
 
 
+async def _resolve_kb_document_names(
+    db: AsyncSession,
+    owner_id: str,
+    document_ids: List[str],
+) -> Dict[str, str]:
+    """Resolve KB document IDs to their uploaded filenames for source display."""
+    valid_ids = []
+    for document_id in document_ids:
+        try:
+            valid_ids.append(uuid.UUID(str(document_id)))
+        except (TypeError, ValueError):
+            continue
+
+    if not valid_ids:
+        return {}
+
+    stmt = select(KBDocument).where(
+        KBDocument.owner_id == owner_id,
+        KBDocument.id.in_(valid_ids),
+    )
+    result = await db.execute(stmt)
+    return {str(doc.id): doc.file_name for doc in result.scalars().all()}
+
+
+async def _build_kb_sources(
+    retrieved_docs,
+    owner_id: str,
+    db: AsyncSession,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Build compact, document-level citations from retrieved chunks.
+
+    The vector store can return several chunks from the same file; the UI only
+    needs a small source list that points users back to each referenced document.
+    """
+    document_ids = [
+        str(doc.metadata.get("document_id"))
+        for doc in retrieved_docs
+        if doc.metadata.get("document_id")
+    ]
+    resolved_names = await _resolve_kb_document_names(db, owner_id, document_ids)
+
+    sources: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for index, doc in enumerate(retrieved_docs):
+        metadata = doc.metadata or {}
+        document_id = str(metadata.get("document_id") or "")
+        source_path = metadata.get("source_path") or metadata.get("source")
+        fallback_name = (
+            metadata.get("doc_name")
+            or metadata.get("file_name")
+            or (Path(str(source_path)).name if source_path else None)
+            or "Uploaded document"
+        )
+        doc_name = resolved_names.get(document_id, str(fallback_name))
+        key = document_id or doc_name
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        sources.append({
+            "document_id": document_id or None,
+            "doc_name": doc_name,
+            "chunk_index": metadata.get("chunk_index", index),
+            "chunk_text": " ".join(doc.page_content.split())[:240],
+            "source_path": str(source_path) if source_path else None,
+        })
+        if len(sources) >= limit:
+            break
+
+    return sources
+
+
 async def chat_with_kb(
     owner_id: str,
     message: str,
     conversation_id: str | None,
     db: AsyncSession
-) -> str:
+) -> Dict[str, Any]:
     """
     Executes the conversational retrieval pipeline with history.
     """
@@ -245,6 +320,7 @@ Answer:"""
     # Load context and run LCEL chain
     retrieved_docs = await _retrieve_documents(retriever, message)
     context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+    sources = await _build_kb_sources(retrieved_docs, owner_id, db)
     chat_history_str = memory.load_memory_variables({})["chat_history"]
 
     chain = prompt | llm | StrOutputParser()
@@ -274,4 +350,8 @@ Answer:"""
     db.add(ai_msg)
     await db.commit()
 
-    return response
+    return {
+        "response": response,
+        "conversation_id": conversation_id,
+        "sources": sources,
+    }

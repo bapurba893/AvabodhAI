@@ -1,5 +1,5 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional, Dict, Any, List
 from uuid import UUID
 
 
@@ -30,5 +30,15 @@ class KBChatRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 
+class KBSourceReference(BaseModel):
+    document_id: Optional[str] = None
+    doc_name: str
+    chunk_index: Optional[int] = None
+    chunk_text: Optional[str] = None
+    source_path: Optional[str] = None
+
+
 class KBChatResponse(BaseModel):
     response: str
+    conversation_id: Optional[str] = None
+    sources: List[KBSourceReference] = Field(default_factory=list)

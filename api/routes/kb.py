@@ -27,6 +27,27 @@ UPLOAD_DIR = "./kb_uploaded_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+def _append_source_line(response_text: str, sources: list) -> str:
+    """Add a compact source citation to the answer text for UI surfaces that only render `response`."""
+    if not sources:
+        return response_text
+
+    source_names = []
+    for source in sources:
+        doc_name = source.get("doc_name") if isinstance(source, dict) else getattr(source, "doc_name", None)
+        if doc_name:
+            source_names.append(str(doc_name))
+
+    source_names = list(dict.fromkeys(source_names))
+    if not source_names:
+        return response_text
+
+    citation = ", ".join(source_names[:3])
+    if "source:" in response_text.lower():
+        return response_text
+    return f"{response_text}\n\nSource: {citation}"
+
+
 async def bg_ingestion_wrapper(file_path: str, owner_id: str, document_id: str):
     """
     Wrapper for running the ingestion pipeline in the background.
@@ -139,6 +160,7 @@ async def retrieve_context(
 @router.post(
     "/chat",
     response_model=KBChatResponse,
+    response_model_exclude_defaults=True,
     summary="Chat with Knowledge Base"
 )
 async def chat_kb(
@@ -152,7 +174,17 @@ async def chat_kb(
             conversation_id=request.conversation_id,
             db=db
         )
-        return KBChatResponse(response=response)
+        if isinstance(response, str):
+            return KBChatResponse(response=response)
+        response_text = _append_source_line(
+            str(response.get("response", "")),
+            response.get("sources", []),
+        )
+        return KBChatResponse(
+            response=response_text,
+            conversation_id=response.get("conversation_id"),
+            sources=response.get("sources", []),
+        )
     except Exception as e:
         logger.exception("Chat request failed")
         raise HTTPException(status_code=500, detail=str(e))
