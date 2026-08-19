@@ -201,7 +201,7 @@ def keyword_search(
         out = []
         for r in results:
             c = _row_to_chunk(r)
-            c["similarity"] = round(float(r.similarity), 4)
+            c["similarity"] = round(float(r.similarity), 4)   # ts_rank score — NOT comparable to vector similarity, see RRF note below
             c["search_type"] = "keyword"
             out.append(c)
         return out
@@ -252,6 +252,41 @@ def _reciprocal_rank_fusion(
 
     merged.sort(key=lambda c: c["rrf_score"], reverse=True)
     return merged[:top_k]
+
+
+def hybrid_search(
+    query_text: str,
+    db: Session,
+    tenant_id: str,
+    org_unit_id: str,
+    top_k: int = 10,
+    doc_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
+) -> list[dict]:
+    """
+    Runs semantic (vector) and keyword (FTS) search independently, then
+    merges via Reciprocal Rank Fusion. This is the main entry point
+    retrieve() now uses. Each side is independently fault-tolerant —
+    vector_search()/keyword_search() already catch their own errors and
+    return [] rather than raising, so if either backend has a bad day,
+    hybrid_search() degrades to whichever side is still working rather
+    than failing the whole request.
+    """
+    query_vector = embed_query(query_text)
+
+    vector_results = vector_search(
+        query_vector=query_vector, db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
+        top_k=top_k * 2, doc_filter=doc_filter, role_filter=role_filter,
+    )
+    keyword_results = keyword_search(
+        query_text=query_text, db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
+        top_k=top_k * 2, doc_filter=doc_filter, role_filter=role_filter,
+    )
+
+    if not vector_results and not keyword_results:
+        return []
+
+    return _reciprocal_rank_fusion([vector_results, keyword_results], top_k=top_k)
 
 
 def contextual_compression(

@@ -3,12 +3,10 @@ api/schemas/document.py
 -----------------------
 Pydantic schemas for request and response validation.
 
-Every API input and output is validated here.
-FastAPI uses these automatically — wrong data type = 422 error with clear message.
-
-NEW: document-level metadata fields added to response schemas
-(title, author, document_type, domain, key_entities, mentioned_dates,
-target_audience, sentiment, confidentiality_level, metadata_status).
+NEW: org_unit_id, category, effective_from/to, is_ground_truth, and
+preview_link added to all document response schemas. title is
+deliberately NOT a client-supplied field anywhere — it stays
+LLM-generated only (see pipeline/storage.py).
 """
 
 from datetime import datetime
@@ -18,13 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 
 
-# ── Request schemas (what user sends) ────────────────────────────────────────
-
 class DocumentUploadResponse(BaseModel):
-    """
-    Returned after successful document upload and summarisation.
-    Every field validated by Pydantic before sending to client.
-    """
     id:           UUID
     doc_name:     str
     summary_text: str
@@ -35,8 +27,12 @@ class DocumentUploadResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
-
-    # ── NEW — document-level extracted metadata ───────────────────────────────
+    tenant_id:    Optional[str] = None   # which tenant this document belongs to
+    org_unit_id:  Optional[str] = None   # NEW — which department, within that tenant
+    category:        Optional[str] = None   # NEW — client-defined free text
+    effective_from:  Optional[datetime] = None   # NEW — metadata only, no retrieval effect
+    effective_to:    Optional[datetime] = None   # NEW — metadata only, no retrieval effect
+    is_ground_truth: Optional[bool] = None       # NEW — gates retrieval
     title:                  Optional[str] = None
     author:                 Optional[str] = None
     document_type:          Optional[str] = None
@@ -47,26 +43,28 @@ class DocumentUploadResponse(BaseModel):
     sentiment:               Optional[str] = None
     confidentiality_level:  Optional[str] = None
     metadata_status:         Optional[str] = None
-
+    image_count:             Optional[int] = 0
+    preview_link:            Optional[str] = None   # NEW — signed file link or source URL
     created_at:   datetime
     updated_at:   Optional[datetime] = None
-    elapsed_sec:  Optional[float] = None    # how long summarisation took
+    elapsed_sec:  Optional[float] = None
 
     class Config:
-        from_attributes = True              # allows creating from SQLAlchemy ORM
+        from_attributes = True
 
 
 class DocumentListItem(BaseModel):
-    """Lightweight schema for listing documents — no full summary text."""
     id:          UUID
     doc_name:    str
     page_count:  int
     chunk_count: int
     model_used:  Optional[str] = None
-    document_type: Optional[str] = None    # NEW — useful for list filtering UI
-    domain:        Optional[str] = None    # NEW
+    document_type: Optional[str] = None
+    domain:        Optional[str] = None
+    category:      Optional[str] = None    # NEW
+    is_ground_truth: Optional[bool] = None  # NEW
+    image_count:   Optional[int] = 0
     created_at:  datetime
-    # First 200 chars of summary as preview
     summary_preview: Optional[str] = None
 
     class Config:
@@ -74,7 +72,6 @@ class DocumentListItem(BaseModel):
 
 
 class DocumentListResponse(BaseModel):
-    """Wrapper for list of documents with pagination info."""
     total:     int
     page:      int
     per_page:  int
@@ -82,7 +79,13 @@ class DocumentListResponse(BaseModel):
 
 
 class DocumentDetailResponse(BaseModel):
-    """Full document detail — same as upload response."""
+    """
+    Also serves as the preview payload — no separate preview endpoint.
+    Everything a preview UI needs is already here: summary, title,
+    tenant_id, org_unit_id, category, effective dates, ground-truth flag,
+    and preview_link (signed file link for uploads, source URL for
+    web-scraped documents).
+    """
     id:           UUID
     doc_name:     str
     summary_text: str
@@ -93,8 +96,12 @@ class DocumentDetailResponse(BaseModel):
     language:     str
     model_used:   Optional[str] = None
     doc_hash:     Optional[str] = None
-
-    # ── NEW — document-level extracted metadata ───────────────────────────────
+    tenant_id:    Optional[str] = None
+    org_unit_id:  Optional[str] = None
+    category:        Optional[str] = None
+    effective_from:  Optional[datetime] = None
+    effective_to:    Optional[datetime] = None
+    is_ground_truth: Optional[bool] = None
     title:                  Optional[str] = None
     author:                 Optional[str] = None
     document_type:          Optional[str] = None
@@ -105,7 +112,8 @@ class DocumentDetailResponse(BaseModel):
     sentiment:               Optional[str] = None
     confidentiality_level:  Optional[str] = None
     metadata_status:         Optional[str] = None
-
+    image_count:             Optional[int] = 0
+    preview_link:            Optional[str] = None
     created_at:   datetime
     updated_at:   Optional[datetime] = None
 
@@ -114,12 +122,7 @@ class DocumentDetailResponse(BaseModel):
 
 
 class DocumentUpdateRequest(BaseModel):
-    """What user can update — only doc_name for now."""
-    doc_name: str = Field(
-        min_length=1,
-        max_length=512,
-        description="New name for the document",
-    )
+    doc_name: str = Field(min_length=1, max_length=512)
 
     @field_validator("doc_name")
     @classmethod
@@ -128,7 +131,6 @@ class DocumentUpdateRequest(BaseModel):
 
 
 class DocumentUpdateResponse(BaseModel):
-    """Returned after successful update."""
     id:         UUID
     doc_name:   str
     updated_at: Optional[datetime] = None
@@ -139,15 +141,11 @@ class DocumentUpdateResponse(BaseModel):
 
 
 class DeleteResponse(BaseModel):
-    """Returned after successful delete."""
     id:      UUID
     message: str = "Document deleted successfully"
 
 
-# ── NEW — Chunk metadata schema (for search/chunk endpoints) ──────────────────
-
 class ChunkMetadataResponse(BaseModel):
-    """Metadata fields for a single chunk — used in search and chunk-listing endpoints."""
     section_heading:     Optional[str] = None
     chunk_type:           Optional[str] = None
     topic:                 Optional[str] = None
@@ -159,28 +157,21 @@ class ChunkMetadataResponse(BaseModel):
         from_attributes = True
 
 
-# ── Error schemas ─────────────────────────────────────────────────────────────
-
 class ErrorResponse(BaseModel):
-    """Standard error response shape."""
     error:   str
     detail:  Optional[str] = None
     status:  int
 
 
 class UploadErrorResponse(BaseModel):
-    """Specific error for upload failures."""
     error:     str
-    step:      str    # which step failed: load, split, summarise, save
+    step:      str
     detail:    Optional[str] = None
     status:    int = 500
 
 
-# ── Processing status schema (for long operations) ────────────────────────────
-
 class ProcessingStatus(BaseModel):
-    """Shows current step during processing."""
     step:        str
     message:     str
-    progress:    int    # 0-100
+    progress:    int
     completed:   bool = False

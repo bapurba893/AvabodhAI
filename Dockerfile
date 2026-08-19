@@ -42,6 +42,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# ── Pre-download NLTK data needed by `unstructured` for DOCX parsing ──────────
+# Without this, the FIRST .docx upload tries to download this data from the
+# internet at runtime, mid-request — and if that download fails (network
+# restrictions, a flaky connection, whatever), the request hangs for minutes
+# before erroring out instead of just working. Baking it into the image here
+# means it's always present, with zero network dependency at runtime.
+RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt_tab punkt
+
 # ── Install Playwright browser ────────────────────────────────────────────────
 RUN playwright install-deps chromium
 RUN playwright install chromium

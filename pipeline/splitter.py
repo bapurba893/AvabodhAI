@@ -19,7 +19,6 @@ HuggingFace change:
 """
 import re
 from langchain_experimental.text_splitter import SemanticChunker
-#from langchain_ollama import OllamaEmbeddings   # was: OpenAIEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -107,15 +106,12 @@ def split_documents(docs: list[Document]) -> list[Document]:
     Split a list of Documents into semantic chunks.
     Returns cleaned, indexed chunks ready for the Map step.
 
-    HuggingFace embeddings run LOCALLY via sentence-transformers.
-    No API call, no cost, no internet needed after first download.
-    Model is cached in ~/.cache/huggingface after first run.
-    """
-    """
-    embeddings = OllamaEmbeddings(
-    model=settings.EMBEDDING_MODEL,
-    base_url=settings.OLLAMA_BASE_URL,
-    )
+    Uses OpenAIEmbeddings (text-embedding-3-small) to compute the semantic
+    breakpoints SemanticChunker splits on. This IS a real OpenAI API call —
+    every chunk-boundary decision costs a small amount of embedding tokens,
+    same as any other embedding call in this app. There is no local/free
+    path currently wired in (an OllamaEmbeddings alternative was tried and
+    is commented out below in earlier history — not active).
     """
     embeddings = OpenAIEmbeddings(
     api_key=settings.OPENAI_API_KEY,

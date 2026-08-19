@@ -11,6 +11,10 @@ from db.models import KBDocument, KBChatHistory
 from db.database import get_async_db_session_fastapi
 
 client = TestClient(app)
+DEFAULT_KB_HEADERS = {
+    "X-Tenant-ID": "test-tenant",
+    "X-Org-Unit-ID": "test-org",
+}
 
 
 @pytest.fixture
@@ -41,7 +45,7 @@ def test_upload_kb_document_endpoint(mock_ingest):
     files = {"file": ("test_doc.txt", file_content, "text/plain")}
     data = {"owner_id": "test_owner_123"}
 
-    response = client.post("/kb/upload", files=files, data=data)
+    response = client.post("/kb/upload", files=files, data=data, headers=DEFAULT_KB_HEADERS)
 
     app.dependency_overrides.clear()
 
@@ -61,7 +65,7 @@ def test_retrieve_context_endpoint(mock_retrieve):
         "filters": {}
     }
 
-    response = client.post("/kb/retrieve", json=payload)
+    response = client.post("/kb/retrieve", json=payload, headers=DEFAULT_KB_HEADERS)
     assert response.status_code == 200
     assert response.json() == ["Relevant context sentence 1", "Relevant context sentence 2"]
     mock_retrieve.assert_called_once_with("test_owner_123", "test query")
@@ -77,7 +81,7 @@ def test_chat_kb_endpoint(mock_chat):
         "conversation_id": "conv_abc"
     }
 
-    response = client.post("/kb/chat", json=payload)
+    response = client.post("/kb/chat", json=payload, headers=DEFAULT_KB_HEADERS)
     assert response.status_code == 200
     assert response.json() == {"response": "This is the AI response based on the context."}
 
@@ -120,7 +124,7 @@ def test_get_kb_status_ready(mock_dep):
 
     app.dependency_overrides[get_async_db_session_fastapi] = override_dep
 
-    response = client.get(f"/kb/status/{doc_id}")
+    response = client.get(f"/kb/status/{doc_id}", headers=DEFAULT_KB_HEADERS)
 
     app.dependency_overrides.clear()
 
@@ -150,7 +154,7 @@ def test_get_kb_status_failed(mock_dep):
 
     app.dependency_overrides[get_async_db_session_fastapi] = override_dep
 
-    response = client.get(f"/kb/status/{doc_id}")
+    response = client.get(f"/kb/status/{doc_id}", headers=DEFAULT_KB_HEADERS)
 
     app.dependency_overrides.clear()
 
@@ -180,7 +184,7 @@ def test_get_kb_status_processing(mock_dep):
 
     app.dependency_overrides[get_async_db_session_fastapi] = override_dep
 
-    response = client.get(f"/kb/status/{doc_id}")
+    response = client.get(f"/kb/status/{doc_id}", headers=DEFAULT_KB_HEADERS)
 
     app.dependency_overrides.clear()
 
@@ -208,7 +212,7 @@ def test_get_kb_status_not_found(mock_dep):
 
     app.dependency_overrides[get_async_db_session_fastapi] = override_dep
 
-    response = client.get(f"/kb/status/{doc_id}")
+    response = client.get(f"/kb/status/{doc_id}", headers=DEFAULT_KB_HEADERS)
 
     app.dependency_overrides.clear()
 

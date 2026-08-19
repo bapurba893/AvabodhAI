@@ -1,187 +1,630 @@
 {
-  "info": {
-    "name": "Avabodh API",
-    "description": "Document Intelligence API — test all endpoints",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-  },
-  "variable": [
-    {
-      "key": "base_url",
-      "value": "http://localhost:8000",
-      "type": "string"
-    },
-    {
-      "key": "doc_id",
-      "value": "",
-      "type": "string"
-    }
-  ],
-  "item": [
-    {
-      "name": "Health",
-      "item": [
-        {
-          "name": "Root",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/",
-            "description": "Check API is running"
-          }
-        },
-        {
-          "name": "Health Check",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/health/",
-            "description": "Basic health check"
-          }
-        },
-        {
-          "name": "Database Health",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/health/db",
-            "description": "Check PostgreSQL connection"
-          }
-        }
-      ]
-    },
-    {
-      "name": "Documents",
-      "item": [
-        {
-          "name": "Upload Document",
-          "request": {
-            "method": "POST",
-            "url": "{{base_url}}/documents/upload",
-            "description": "Upload PDF/TXT/DOCX/CSV — generates summary and saves to PostgreSQL",
-            "body": {
-              "mode": "formdata",
-              "formdata": [
-                {
-                  "key": "file",
-                  "type": "file",
-                  "description": "Select your PDF, TXT, DOCX or CSV file here"
-                }
-              ]
-            }
-          },
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "exec": [
-                  "if (pm.response.code === 201 || pm.response.code === 200) {",
-                  "    var data = pm.response.json();",
-                  "    pm.collectionVariables.set('doc_id', data.id);",
-                  "    console.log('Saved doc_id:', data.id);",
-                  "}"
-                ]
-              }
-            }
-          ]
-        },
-        {
-          "name": "List All Documents",
-          "request": {
-            "method": "GET",
-            "url": {
-              "raw": "{{base_url}}/documents/?page=1&per_page=10",
-              "query": [
-                {"key": "page", "value": "1"},
-                {"key": "per_page", "value": "10"}
-              ]
-            },
-            "description": "List all summaries with pagination"
-          }
-        },
-        {
-          "name": "Get Document by ID",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/documents/{{doc_id}}",
-            "description": "Get full summary by UUID — auto-filled after upload"
-          }
-        },
-        {
-          "name": "Update Document Name",
-          "request": {
-            "method": "PATCH",
-            "url": "{{base_url}}/documents/{{doc_id}}",
-            "description": "Rename a document",
-            "header": [
-              {"key": "Content-Type", "value": "application/json"}
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n    \"doc_name\": \"My Renamed Document\"\n}"
-            }
-          }
-        },
-        {
-          "name": "Delete Document",
-          "request": {
-            "method": "DELETE",
-            "url": "{{base_url}}/documents/{{doc_id}}",
-            "description": "Permanently delete a document summary"
-          }
-        }
-      ]
-    },
-    {
-      "name": "Validation Tests",
-      "item": [
-        {
-          "name": "Upload Invalid File Type",
-          "request": {
-            "method": "POST",
-            "url": "{{base_url}}/documents/upload",
-            "description": "Should return 422 — .exe not allowed",
-            "body": {
-              "mode": "formdata",
-              "formdata": [
-                {
-                  "key": "file",
-                  "value": "fake content",
-                  "type": "text",
-                  "description": "test.exe — should be rejected"
-                }
-              ]
-            }
-          }
-        },
-        {
-          "name": "Get Invalid UUID",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/documents/not-a-valid-uuid",
-            "description": "Should return 422 — invalid UUID format"
-          }
-        },
-        {
-          "name": "Get Nonexistent Document",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url}}/documents/00000000-0000-0000-0000-000000000000",
-            "description": "Should return 404 — document not found"
-          }
-        },
-        {
-          "name": "Update Empty Name",
-          "request": {
-            "method": "PATCH",
-            "url": "{{base_url}}/documents/{{doc_id}}",
-            "description": "Should return 422 — empty doc_name not allowed",
-            "header": [
-              {"key": "Content-Type", "value": "application/json"}
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n    \"doc_name\": \"\"\n}"
-            }
-          }
-        }
-      ]
-    }
-  ]
+	"info": {
+		"name": "Avabodh API",
+		"description": "Document Intelligence API \u2014 test all endpoints",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "doc_id",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "tenant_id",
+			"value": "test-tenant-1",
+			"type": "string"
+		},
+		{
+			"key": "org_unit_id",
+			"value": "test-org-unit-1",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health",
+			"item": [
+				{
+					"name": "Root",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/",
+						"description": "Check API is running",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/health/",
+						"description": "Basic health check",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Database Health",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/health/db",
+						"description": "Check PostgreSQL connection",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				}
+			]
+		},
+		{
+			"name": "Documents",
+			"item": [
+				{
+					"name": "Upload Document",
+					"request": {
+						"method": "POST",
+						"url": "{{base_url}}/documents/upload",
+						"description": "Upload PDF/TXT/DOCX/CSV \u2014 generates summary and saves to PostgreSQL",
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"type": "file",
+									"description": "Select your PDF, TXT, DOCX or CSV file here"
+								}
+							]
+						},
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 201 || pm.response.code === 200) {",
+									"    var data = pm.response.json();",
+									"    pm.collectionVariables.set('doc_id', data.id);",
+									"    console.log('Saved doc_id:', data.id);",
+									"}"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "List All Documents",
+					"request": {
+						"method": "GET",
+						"url": {
+							"raw": "{{base_url}}/documents/?page=1&per_page=10",
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "per_page",
+									"value": "10"
+								}
+							]
+						},
+						"description": "List all summaries with pagination",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Get Document by ID",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/documents/{{doc_id}}",
+						"description": "Get full summary by UUID \u2014 auto-filled after upload",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Get Fresh Preview URL",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/documents/{{doc_id}}/preview-url",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"documents",
+								"{{doc_id}}",
+								"preview-url"
+							]
+						},
+						"description": "Dedicated endpoint \u2014 returns just a fresh preview_link, not the full document payload. Call this every time a user wants to view a document, rather than caching an old link."
+					},
+					"response": []
+				},
+				{
+					"name": "Update Document Name",
+					"request": {
+						"method": "PATCH",
+						"url": "{{base_url}}/documents/{{doc_id}}",
+						"description": "Rename a document",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"doc_name\": \"My Renamed Document\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Delete Document",
+					"request": {
+						"method": "DELETE",
+						"url": "{{base_url}}/documents/{{doc_id}}",
+						"description": "Permanently delete a document summary",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				}
+			]
+		},
+		{
+			"name": "Validation Tests",
+			"item": [
+				{
+					"name": "Upload Invalid File Type",
+					"request": {
+						"method": "POST",
+						"url": "{{base_url}}/documents/upload",
+						"description": "Should return 422 \u2014 .exe not allowed",
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"value": "fake content",
+									"type": "text",
+									"description": "test.exe \u2014 should be rejected"
+								}
+							]
+						},
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Get Invalid UUID",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/documents/not-a-valid-uuid",
+						"description": "Should return 422 \u2014 invalid UUID format",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Get Nonexistent Document",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/documents/00000000-0000-0000-0000-000000000000",
+						"description": "Should return 404 \u2014 document not found",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Update Empty Name",
+					"request": {
+						"method": "PATCH",
+						"url": "{{base_url}}/documents/{{doc_id}}",
+						"description": "Should return 422 \u2014 empty doc_name not allowed",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"doc_name\": \"\"\n}"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "Search",
+			"item": [
+				{
+					"name": "Hybrid Search (default)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"annual leave policy\",\n  \"top_k\": 5,\n  \"search_mode\": \"hybrid\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Semantic + keyword combined via Reciprocal Rank Fusion. This is the default \u2014 omitting search_mode entirely does the same thing."
+					},
+					"response": []
+				},
+				{
+					"name": "Semantic Search Only",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"annual leave policy\",\n  \"top_k\": 5,\n  \"search_mode\": \"semantic\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Vector similarity only \u2014 good for meaning-based queries, weak on exact codes/IDs."
+					},
+					"response": []
+				},
+				{
+					"name": "Keyword Search Only",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"GO-2024-0451\",\n  \"top_k\": 5,\n  \"search_mode\": \"keyword\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Exact full-text match via chunk_tsvector \u2014 good for exact reference numbers, codes, acronyms."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Document Chunks",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/search/chunks/{{doc_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"search",
+								"chunks",
+								"{{doc_id}}"
+							]
+						},
+						"description": "Inspect all stored chunks for a document, including has_tsvector to confirm the FTS trigger populated it."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Chat",
+			"item": [
+				{
+					"name": "Send Message",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required \u2014 every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required \u2014 department-level isolation within the tenant."
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{base_url}}/chat/message",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"chat",
+								"message"
+							]
+						},
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"What is this document about?\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"description": "Starts a new thread if thread_id is omitted. Uses hybrid retrieval automatically."
+					},
+					"response": []
+				}
+			]
+		}
+	]
 }

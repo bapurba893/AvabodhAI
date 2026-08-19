@@ -40,11 +40,36 @@ services:
       DB_NAME:              ${DB_NAME:-avabodh}
       DB_USER:              ${DB_USER:-postgres}
       DB_PASSWORD:          ${DB_PASSWORD}
+      # Restricted app role — created automatically by init_db() on first
+      # boot, using DB_USER/DB_PASSWORD above just for that one bootstrap
+      # step. This is what the app actually queries with afterward, and
+      # what Row-Level Security genuinely restricts (RLS cannot restrict
+      # DB_USER if it's a Postgres superuser, which it is by default in
+      # this setup — see db/database.py for the full explanation).
+      # CHANGE APP_DB_PASSWORD before any real deployment.
+      APP_DB_USER:          ${APP_DB_USER:-avabodh_app}
+      APP_DB_PASSWORD:      ${APP_DB_PASSWORD:-CHANGE-ME-app-role-password}
+      FTS_LANGUAGE:         ${FTS_LANGUAGE:-english}
+      HYBRID_RRF_K:         ${HYBRID_RRF_K:-60}
       DOCUMENTS_DIR:        ./documents
       MIN_CHUNK_SIZE:       ${MIN_CHUNK_SIZE:-100}
       MAX_CHUNK_SIZE:       ${MAX_CHUNK_SIZE:-3000}
       SUMMARY_MAX_LENGTH:   ${SUMMARY_MAX_LENGTH:-2000}
       SUMMARY_LANGUAGE:     ${SUMMARY_LANGUAGE:-English}
+      VISION_MODEL:         ${VISION_MODEL:-gpt-4o}
+      IMAGE_MIN_SIZE_BYTES: ${IMAGE_MIN_SIZE_BYTES:-5000}
+      IMAGE_MAX_DIMENSION:  ${IMAGE_MAX_DIMENSION:-1024}
+      IMAGE_MAX_WORKERS:    ${IMAGE_MAX_WORKERS:-4}
+      # SECRET_KEY signs the document preview file links (GET /documents/{id}/file).
+      # The Python-level default is deliberately an obvious placeholder — set a
+      # real value here (or in .env) before any production deployment, or the
+      # API logs a loud warning on startup and preview links stay forgeable.
+      SECRET_KEY:            ${SECRET_KEY:-dev-only-CHANGE-ME-in-production}
+      # FILE_LINK_TTL_SECONDS deliberately NOT set here — preview links
+      # don't expire by default (see config/settings.py). If a TTL is
+      # ever needed again, add FILE_LINK_TTL_SECONDS=<seconds> to .env
+      # AND add the line back here — don't set it to an empty value,
+      # pydantic-settings will fail trying to parse "" as int.
       LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
       LANGCHAIN_ENDPOINT:   ${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
       LANGCHAIN_API_KEY:    ${LANGCHAIN_API_KEY}

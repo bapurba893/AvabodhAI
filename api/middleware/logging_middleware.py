@@ -17,11 +17,16 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         start = time.time()
         response = await call_next(request)
         elapsed = round((time.time() - start) * 1000, 2)
+        # Logged whenever present — not enforced here (that's
+        # api.dependencies.get_tenant_id's job), just surfaced so a
+        # tenant-specific incident can be traced straight from the logs.
+        tenant_id = request.headers.get("x-tenant-id", "-")
         logger.info(
-            "%s %s -> %d | %.2fms",
+            "%s %s -> %d | %.2fms | tenant=%s",
             request.method,
             request.url.path,
             response.status_code,
             elapsed,
+            tenant_id,
         )
         return response

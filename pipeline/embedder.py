@@ -1,21 +1,19 @@
 """
 pipeline/embedder.py
 --------------------
-NEW Step — Generate and store chunk embeddings in pgvector.
+Generate and store chunk embeddings in pgvector.
 
-Flow:
-    chunks (from splitter)
-        → OpenAI Embeddings (parallel batches)
-        → DocumentChunk records  (with chunk-level metadata if available)
-        → PostgreSQL with pgvector
+Two entry points:
+  store_chunk_embeddings()   — text chunks
+  embed_and_store_images()   — image chunks (called after image_processor)
 
-Features:
-- Parallel embedding generation (batch of 100 per API call)
-- Pydantic validation per chunk
-- Updates DocumentSummary.embedding_status
-- Skips already-embedded documents (dedup)
-- NEW: Saves chunk-level metadata (section_heading, chunk_type, topic,
-       entities, contains_data, metadata_confidence) extracted by summariser
+Both are scoped by (tenant_id, org_unit_id) together — org_unit_id is a
+hard boundary WITHIN a tenant (department-level isolation), so every dedup
+check and every stamped record uses both, never tenant_id alone.
+
+is_ground_truth is stamped onto every chunk (text and image) from the
+parent document's value, denormalized the same way tenant_id/org_unit_id
+are — retrieval filters on it directly with no join.
 """
 
 import gc
@@ -27,10 +25,10 @@ from uuid import UUID
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy.orm import make_transient
 
 from db.database import get_db_session_context
 from db.models import DocumentChunk, DocumentSummary, ChunkMetadataOutput
+from pipeline.image_processor import ImageCaptionOutput, build_image_embedding_text
 from config.settings import get_settings
 from utils.logger import get_logger
 
@@ -43,7 +41,6 @@ settings = get_settings()
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChunkEmbeddingInput(BaseModel):
-    """Validates chunk data before embedding and storing."""
     chunk_index:  int            = Field(ge=0)
     total_chunks: int            = Field(ge=1)
     chunk_text:   str            = Field(min_length=1)
@@ -65,7 +62,6 @@ class ChunkEmbeddingInput(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_embeddings_client() -> OpenAIEmbeddings:
-    """Build OpenAI embeddings client."""
     return OpenAIEmbeddings(
         api_key=settings.OPENAI_API_KEY,
         model=settings.EMBEDDING_MODEL,
@@ -73,27 +69,56 @@ def _get_embeddings_client() -> OpenAIEmbeddings:
 
 
 def _embed_batch(texts: list[str], client: OpenAIEmbeddings) -> list[list[float]]:
-    """
-    Embed a batch of texts in one API call.
-    OpenAI supports up to 2048 texts per batch.
-    Batching is much cheaper than one call per chunk.
-    """
     return client.embed_documents(texts)
 
 
-def check_embeddings_exist(doc_hash: str) -> bool:
-    """Check if embeddings already stored for this document."""
-    with get_db_session_context() as session:
+def check_embeddings_exist(doc_hash: str, tenant_id: str, org_unit_id: str) -> bool:
+    """
+    True if TEXT chunks already exist for this doc_hash, within this
+    tenant AND org unit. Filtered to role='text' so a document that
+    (somehow) only has image chunks stored doesn't cause text
+    re-embedding to be skipped, and to (tenant_id, org_unit_id) together
+    so it can't be tripped by another tenant's — or another department's
+    — identical content.
+    """
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         count = (
             session.query(DocumentChunk)
-            .filter(DocumentChunk.doc_hash == doc_hash)
+            .filter(
+                DocumentChunk.doc_hash == doc_hash,
+                DocumentChunk.role == "text",
+                DocumentChunk.tenant_id == tenant_id,
+                DocumentChunk.org_unit_id == org_unit_id,
+            )
+            .count()
+        )
+        return count > 0
+
+
+def check_image_hash_exists(image_bytes_hash: str, tenant_id: str, org_unit_id: str) -> bool:
+    """
+    Check if this exact image is already embedded for this tenant+org
+    unit — dedup. Scoped by both: if two departments (or two tenants)
+    both have a document containing the same stock image or shared logo,
+    one's upload must NOT be skipped just because the other already has
+    that hash — that would leave the second one missing the image chunk.
+    """
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
+        count = (
+            session.query(DocumentChunk)
+            .filter(
+                DocumentChunk.image_bytes_hash == image_bytes_hash,
+                DocumentChunk.role == "image",
+                DocumentChunk.tenant_id == tenant_id,
+                DocumentChunk.org_unit_id == org_unit_id,
+            )
             .count()
         )
         return count > 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main entry point
+# Text chunk embeddings
 # ─────────────────────────────────────────────────────────────────────────────
 
 def store_chunk_embeddings(
@@ -101,47 +126,27 @@ def store_chunk_embeddings(
     summary_id: UUID,
     doc_hash: str,
     doc_name: str,
+    tenant_id: str,
+    org_unit_id: str,
+    is_ground_truth: bool = False,
     source_path: str = "",
     chunk_metadata: Optional[list[Optional[ChunkMetadataOutput]]] = None,
 ) -> dict:
     """
-    Main function — generates and stores embeddings for all chunks.
-
-    Steps:
-    1. Validate all chunks with Pydantic
-    2. Generate embeddings in batches of 100 (OpenAI rate-limit safe)
-    3. Save all DocumentChunk records to PostgreSQL
-       NEW: Populates chunk-level metadata columns if chunk_metadata is provided
-            (section_heading, chunk_type, topic, entities, contains_data,
-             metadata_confidence) — each entry may be None if extraction
-             failed for that chunk; those fields will be left as NULL.
-    4. Update DocumentSummary.embedding_status → 'completed'
-
-    Args:
-        chunks:         LangChain Document list from splitter.
-        summary_id:     UUID of the parent DocumentSummary row.
-        doc_hash:       SHA-256 hash of the source file (for dedup).
-        doc_name:       Display name of the document.
-        source_path:    Absolute path of the saved file.
-        chunk_metadata: Optional list of ChunkMetadataOutput objects,
-                        aligned index-for-index with `chunks`.
-                        Produced by summariser.summarise_document().
-
-    Returns:
-        dict with status, doc_name, chunk_count, elapsed_sec, model.
+    Generate and store text chunk embeddings.
+    tenant_id + org_unit_id are stamped onto every DocumentChunk row
+    (denormalized from the parent document) so vector_search() can
+    filter directly without a JOIN. is_ground_truth is stamped the same
+    way — always enforced at retrieval, no per-query toggle.
+    Image chunks go through embed_and_store_images().
     """
     if not chunks:
         raise ValueError(f"No chunks provided for '{doc_name}'")
 
-    # ── Dedup — skip if already embedded ─────────────────────────────────
-    if check_embeddings_exist(doc_hash):
-        logger.info("Embeddings already exist for '%s' — skipping", doc_name)
-        return {
-            "status":      "skipped",
-            "doc_name":    doc_name,
-            "chunk_count": 0,
-            "elapsed_sec": 0.0,
-        }
+    if check_embeddings_exist(doc_hash, tenant_id, org_unit_id):
+        logger.info("Embeddings already exist for tenant=%s org_unit=%s '%s' — skipping",
+                    tenant_id, org_unit_id, doc_name)
+        return {"status": "skipped", "doc_name": doc_name, "chunk_count": 0, "elapsed_sec": 0.0}
 
     logger.info(
         "Starting embedding for '%s' — %d chunks | model=%s",
@@ -151,15 +156,13 @@ def store_chunk_embeddings(
     start = time.time()
     total_chunks = len(chunks)
 
-    # Normalise chunk_metadata length — pad with None if shorter than chunks
     meta_list: list[Optional[ChunkMetadataOutput]] = []
     if chunk_metadata:
         meta_list = list(chunk_metadata)
-    # Pad to same length as chunks so zip() is always safe
     while len(meta_list) < total_chunks:
         meta_list.append(None)
 
-    # ── Step 1: Pydantic validation ───────────────────────────────────────
+    # ── Pydantic validation ───────────────────────────────────────────────────
     validated_chunks: list[ChunkEmbeddingInput] = []
     validated_meta:   list[Optional[ChunkMetadataOutput]] = []
 
@@ -184,95 +187,70 @@ def store_chunk_embeddings(
     if not validated_chunks:
         raise ValueError("All chunks failed Pydantic validation")
 
-    logger.info(
-        "%d/%d chunks passed validation", len(validated_chunks), total_chunks
-    )
-
-    # ── Step 2: Generate embeddings in batches ────────────────────────────
+    # ── Embed in batches ──────────────────────────────────────────────────────
     client = _get_embeddings_client()
     texts = [c.chunk_text for c in validated_chunks]
-
-    batch_size = 100   # safe for OpenAI rate limits
+    batch_size = 100
     all_embeddings: list[list[float]] = []
     total_batches = (len(texts) + batch_size - 1) // batch_size
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         try:
-            batch_embeddings = _embed_batch(batch, client)
-            all_embeddings.extend(batch_embeddings)
-            logger.info(
-                "Embedded batch %d/%d (%d chunks)",
-                (i // batch_size) + 1,
-                total_batches,
-                len(batch),
-            )
+            all_embeddings.extend(_embed_batch(batch, client))
+            logger.info("Embedded batch %d/%d", (i // batch_size) + 1, total_batches)
         except Exception as e:
-            logger.error("Embedding batch %d failed: %s", (i // batch_size) + 1, e)
-            raise RuntimeError(
-                f"Embedding failed at batch {(i // batch_size) + 1}: {e}"
-            )
+            raise RuntimeError(f"Embedding failed at batch {(i // batch_size) + 1}: {e}")
 
-    logger.info("All %d embeddings generated", len(all_embeddings))
-
-    # ── Step 3: Build DocumentChunk records ───────────────────────────────
+    # ── Build records ─────────────────────────────────────────────────────────
     chunk_records: list[DocumentChunk] = []
 
-    for validated, embedding_vector, meta in zip(
-        validated_chunks, all_embeddings, validated_meta
-    ):
+    for validated, embedding_vector, meta in zip(validated_chunks, all_embeddings, validated_meta):
         record = DocumentChunk(
-            summary_id      = summary_id,
-            doc_hash        = validated.doc_hash,
-            doc_name        = validated.doc_name,
-            chunk_index     = validated.chunk_index,
-            total_chunks    = validated.total_chunks,
-            chunk_text      = validated.chunk_text,
-            chunk_size      = validated.chunk_size,
-            page_number     = validated.page_number,
-            source_path     = validated.source_path,
-            language        = validated.language,
-            embedding       = embedding_vector,
-            embedding_model = settings.EMBEDDING_MODEL,
-            # ── NEW — chunk-level metadata (None if extraction failed) ─────
-            section_heading    = meta.section_heading   if meta else None,
+            tenant_id           = tenant_id,
+            org_unit_id         = org_unit_id,
+            is_ground_truth     = is_ground_truth,
+            summary_id          = summary_id,
+            doc_hash            = validated.doc_hash,
+            doc_name            = validated.doc_name,
+            chunk_index         = validated.chunk_index,
+            total_chunks        = validated.total_chunks,
+            chunk_text          = validated.chunk_text,
+            chunk_size          = validated.chunk_size,
+            page_number         = validated.page_number,
+            source_path         = validated.source_path,
+            language            = validated.language,
+            embedding           = embedding_vector,
+            embedding_model     = settings.EMBEDDING_MODEL,
+            role                = "text",
+            section_heading     = meta.section_heading   if meta else None,
             chunk_type          = meta.chunk_type        if meta else "paragraph",
-            topic                = meta.topic             if meta else None,
-            entities              = meta.entities          if meta else None,
-            contains_data         = meta.contains_data     if meta else False,
-            metadata_confidence   = meta.confidence_score  if meta else None,
+            topic               = meta.topic             if meta else None,
+            entities            = meta.entities          if meta else None,
+            contains_data       = meta.contains_data     if meta else False,
+            metadata_confidence = meta.confidence_score  if meta else None,
         )
         chunk_records.append(record)
 
-    # ── Step 4: Bulk insert + update DocumentSummary ──────────────────────
-    with get_db_session_context() as session:
+    # ── Bulk insert + update summary ──────────────────────────────────────────
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         session.bulk_save_objects(chunk_records)
 
-        summary = (
-            session.query(DocumentSummary)
-            .filter(DocumentSummary.id == summary_id)
-            .first()
-        )
+        summary = session.query(DocumentSummary).filter(
+            DocumentSummary.id == summary_id,
+            DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
+        ).first()
         if summary:
             summary.embedding_status    = "completed"
             summary.embedding_model     = settings.EMBEDDING_MODEL
             summary.embedding_stored_at = datetime.now(timezone.utc)
-            avg_size = (
-                sum(c.chunk_size for c in validated_chunks) // len(validated_chunks)
-            )
-            summary.avg_chunk_size = avg_size
+            summary.avg_chunk_size = sum(c.chunk_size for c in validated_chunks) // len(validated_chunks)
             session.add(summary)
 
     elapsed = round(time.time() - start, 2)
-    logger.info(
-        "Embeddings stored for '%s' — %d chunks | metadata=%s | time=%.2fs",
-        doc_name,
-        len(chunk_records),
-        "yes" if chunk_metadata else "no",
-        elapsed,
-    )
+    logger.info("Text embeddings stored for '%s' — %d chunks | %.2fs", doc_name, len(chunk_records), elapsed)
 
-    # Free memory
     del chunk_records
     gc.collect()
 
@@ -280,6 +258,165 @@ def store_chunk_embeddings(
         "status":      "completed",
         "doc_name":    doc_name,
         "chunk_count": len(validated_chunks),
+        "elapsed_sec": elapsed,
+        "model":       settings.EMBEDDING_MODEL,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image embeddings
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImageEmbeddingInput(BaseModel):
+    """One image ready to be embedded and stored."""
+    summary_id:        UUID
+    doc_hash:          str
+    doc_name:          str
+    source_path:       str        = ""
+    page_number:       Optional[int] = None
+    image_bytes_hash:  str
+    image_url:         Optional[str] = None
+    image_format:      str        = "jpeg"
+    image_width:       int        = 0
+    image_height:      int        = 0
+    image_size_bytes:  int        = 0
+    image_caption:     str
+    image_type:        str
+    image_alt_text:    str        = ""
+    image_context:     str        = ""
+    contains_chart:    bool       = False
+    contains_table:    bool       = False
+    contains_text_img: bool       = False
+    key_elements:      list[str]  = Field(default_factory=list)
+    vision_model_used: str        = "gpt-4o"
+    vision_confidence: float      = 0.8
+    embedding_text:    str        = ""   # composite text fed to embedding model
+    chunk_index:       int        = 0
+    total_chunks:      int        = 1
+
+
+def embed_and_store_images(
+    images: list[ImageEmbeddingInput],
+    summary_id: UUID,
+    doc_name:   str,
+    tenant_id:  str,
+    org_unit_id: str,
+    is_ground_truth: bool = False,
+) -> dict:
+    """
+    Embed image caption composite texts and store as DocumentChunk rows
+    with role='image'. tenant_id + org_unit_id are stamped onto every
+    record and used to scope the dedup check — see
+    check_image_hash_exists() docstring for why this must be per
+    tenant+org-unit, not global. is_ground_truth stamped the same way,
+    always enforced at retrieval.
+
+    Called after image_processor.py has already:
+    - filtered noise
+    - called GPT-4o Vision
+    - built ImageCaptionOutput
+
+    This function handles only embedding + DB storage.
+    """
+    if not images:
+        logger.info("No images to embed for '%s'", doc_name)
+        return {"status": "skipped", "doc_name": doc_name, "image_count": 0}
+
+    start = time.time()
+    client = _get_embeddings_client()
+
+    # Filter out already-embedded images (dedup by image_bytes_hash, per tenant+org_unit)
+    new_images = []
+    for img in images:
+        if check_image_hash_exists(img.image_bytes_hash, tenant_id, org_unit_id):
+            logger.info("Image already embedded for tenant=%s org_unit=%s (hash=%s) — skipping",
+                        tenant_id, org_unit_id, img.image_bytes_hash[:12])
+        else:
+            new_images.append(img)
+
+    if not new_images:
+        return {"status": "all_duplicate", "doc_name": doc_name, "image_count": 0}
+
+    # Embed composite caption texts in batches
+    texts = [img.embedding_text for img in new_images]
+    batch_size = 100
+    all_embeddings: list[list[float]] = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        try:
+            all_embeddings.extend(_embed_batch(batch, client))
+        except Exception as e:
+            logger.error("Image embedding batch failed: %s", e)
+            raise RuntimeError(f"Image embedding failed: {e}")
+
+    # Build DocumentChunk records with role='image'
+    image_records: list[DocumentChunk] = []
+
+    for img, embedding_vector in zip(new_images, all_embeddings):
+        record = DocumentChunk(
+            tenant_id          = tenant_id,
+            org_unit_id        = org_unit_id,
+            is_ground_truth    = is_ground_truth,
+            summary_id         = img.summary_id,
+            doc_hash           = img.doc_hash,
+            doc_name           = img.doc_name,
+            chunk_index        = img.chunk_index,
+            total_chunks       = img.total_chunks,
+            chunk_text         = img.embedding_text,   # composite caption text
+            chunk_size         = len(img.embedding_text),
+            page_number        = img.page_number,
+            source_path        = img.source_path,
+            language           = "English",
+            embedding          = embedding_vector,
+            embedding_model    = settings.EMBEDDING_MODEL,
+            # ── Image-specific fields ──────────────────────────────────────
+            role               = "image",
+            image_url          = img.image_url,
+            image_bytes_hash   = img.image_bytes_hash,
+            image_format       = img.image_format,
+            image_width        = img.image_width,
+            image_height       = img.image_height,
+            image_size_bytes   = img.image_size_bytes,
+            image_caption      = img.image_caption,
+            image_type         = img.image_type,
+            image_alt_text     = img.image_alt_text,
+            image_context      = img.image_context,
+            contains_chart     = img.contains_chart,
+            contains_table     = img.contains_table,
+            contains_text_img  = img.contains_text_img,
+            key_elements       = img.key_elements,
+            vision_model_used  = img.vision_model_used,
+            vision_confidence  = img.vision_confidence,
+        )
+        image_records.append(record)
+
+    # Bulk insert + update image_count on summary
+    with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
+        session.bulk_save_objects(image_records)
+
+        summary = session.query(DocumentSummary).filter(
+            DocumentSummary.id == summary_id,
+            DocumentSummary.tenant_id == tenant_id,
+            DocumentSummary.org_unit_id == org_unit_id,
+        ).first()
+        if summary:
+            summary.image_count = (summary.image_count or 0) + len(image_records)
+            session.add(summary)
+
+    elapsed = round(time.time() - start, 2)
+    logger.info(
+        "Image embeddings stored for '%s' — %d images | %.2fs",
+        doc_name, len(image_records), elapsed,
+    )
+
+    del image_records
+    gc.collect()
+
+    return {
+        "status":      "completed",
+        "doc_name":    doc_name,
+        "image_count": len(new_images),
         "elapsed_sec": elapsed,
         "model":       settings.EMBEDDING_MODEL,
     }
